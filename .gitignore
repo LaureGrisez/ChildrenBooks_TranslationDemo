@@ -4,3 +4,10 @@
 Library/
 __pycache__/
 *.pyc
+*.pdf
+*.txt
+*.log
+*.csv
+*.xlsx
+*.zip
+*.tar.gz
