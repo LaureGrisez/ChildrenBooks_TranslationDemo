@@ -1,12 +1,13 @@
-"""Extract plain text from a PDF while skipping front and back matter.
+"""Repair text extracted from French PDFs.
 
 Usage:
-    python src/utils/pdf_text_extractor.py book.pdf
-    python src/utils/pdf_text_extractor.py book.pdf -o extracted.txt
-    python src/utils/pdf_text_extractor.py book.pdf -o repaired.txt --repair
-    python src/utils/pdf_text_extractor.py book.pdf -o repaired.txt --llm
+    python src/utils/text_repair.py input.txt -o repaired.txt
+    python src/utils/text_repair.py input.txt -o repaired.txt --llm
 
-The default behavior skips the first 5 pages and the last 4 pages.
+The default repair is deterministic and handles common PDF extraction issues,
+especially ligatures such as "ﬁ" and "ﬂ" that sometimes become split words.
+The optional LLM mode can be useful for messier OCR/text extraction, but the
+deterministic mode is enough for simple cases like "difﬁ cile" -> "difficile".
 """
 
 from __future__ import annotations
@@ -15,11 +16,7 @@ import argparse
 import re
 from pathlib import Path
 
-import fitz  # PyMuPDF
 
-
-DEFAULT_SKIP_FIRST = 5
-DEFAULT_SKIP_LAST = 4
 DEFAULT_LLM_MODEL = "gpt-4o-mini"
 
 
@@ -34,31 +31,6 @@ LIGATURES = {
 }
 
 
-def extract_pdf_text(
-    pdf_path: Path,
-    skip_first: int = DEFAULT_SKIP_FIRST,
-    skip_last: int = DEFAULT_SKIP_LAST,
-) -> str:
-    """Return plain text from a PDF, excluding the first and last pages."""
-
-    if skip_first < 0 or skip_last < 0:
-        raise ValueError("skip_first and skip_last must be zero or greater.")
-
-    with fitz.open(pdf_path) as document:
-        page_count = document.page_count
-        start_page = min(skip_first, page_count)
-        end_page = max(start_page, page_count - skip_last)
-
-        pages_text: list[str] = []
-        for page_index in range(start_page, end_page):
-            page = document.load_page(page_index)
-            text = page.get_text("text").strip()
-            if text:
-                pages_text.append(text)
-
-    return "\n\n".join(pages_text)
-
-
 def normalize_ligatures(text: str) -> str:
     """Replace PDF ligature characters with normal letters."""
 
@@ -68,7 +40,13 @@ def normalize_ligatures(text: str) -> str:
 
 
 def mend_ligature_word_splits(text: str) -> str:
-    """Join words split immediately after a ligature replacement."""
+    """Join words split immediately after a ligature replacement.
+
+    Examples:
+        "fi n" -> "fin"
+        "diffi cile" -> "difficile"
+        "souffl e" -> "souffle"
+    """
 
     return re.sub(
         r"\b([A-Za-zÀ-ÖØ-öø-ÿ]*(?:fi|fl|ffi|ffl))\s+([a-zà-öø-ÿ]{1,20})\b",
@@ -99,7 +77,6 @@ def llm_repair(text: str, model: str = DEFAULT_LLM_MODEL) -> str:
     """Ask a small LLM to lightly repair extraction artifacts in French text."""
 
     from dotenv import load_dotenv
-
     load_dotenv()
 
     from openai import OpenAI
@@ -119,7 +96,10 @@ def llm_repair(text: str, model: str = DEFAULT_LLM_MODEL) -> str:
                     "n'ajoute rien et conserve les paragraphes autant que possible."
                 ),
             },
-            {"role": "user", "content": text},
+            {
+                "role": "user",
+                "content": text,
+            },
         ],
     )
     repaired = response.choices[0].message.content or ""
@@ -136,42 +116,22 @@ def repair_text(text: str, use_llm: bool = False, model: str = DEFAULT_LLM_MODEL
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments for the extraction script."""
+    """Parse command-line arguments for the repair script."""
 
     parser = argparse.ArgumentParser(
-        description=(
-            "Extract plain text from a PDF, skipping the first 5 pages and "
-            "the last 4 pages by default."
-        )
+        description="Repair French text extracted from a PDF."
     )
-    parser.add_argument("pdf", type=Path, help="Path to the input PDF file.")
+    parser.add_argument("input", type=Path, help="Path to the extracted text file.")
     parser.add_argument(
         "-o",
         "--output",
         type=Path,
-        help="Optional path for the extracted text file. Prints to stdout if omitted.",
-    )
-    parser.add_argument(
-        "--skip-first",
-        type=int,
-        default=DEFAULT_SKIP_FIRST,
-        help=f"Number of pages to skip from the start. Default: {DEFAULT_SKIP_FIRST}.",
-    )
-    parser.add_argument(
-        "--skip-last",
-        type=int,
-        default=DEFAULT_SKIP_LAST,
-        help=f"Number of pages to skip from the end. Default: {DEFAULT_SKIP_LAST}.",
-    )
-    parser.add_argument(
-        "--repair",
-        action="store_true",
-        help="Apply deterministic French PDF text repairs after extraction.",
+        help="Optional output path. Prints repaired text to stdout if omitted.",
     )
     parser.add_argument(
         "--llm",
         action="store_true",
-        help="Also use a small LLM to repair extraction artifacts.",
+        help="Also use a small LLM after deterministic cleanup.",
     )
     parser.add_argument(
         "--model",
@@ -182,24 +142,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Run PDF text extraction from the command line."""
+    """Run text repair from the command line."""
 
     args = parse_args()
-    extracted_text = extract_pdf_text(
-        args.pdf,
-        skip_first=args.skip_first,
-        skip_last=args.skip_last,
-    )
-    output_text = (
-        repair_text(extracted_text, use_llm=args.llm, model=args.model)
-        if args.repair or args.llm
-        else extracted_text
-    )
+    input_text = args.input.read_text(encoding="utf-8")
+    repaired_text = repair_text(input_text, use_llm=args.llm, model=args.model)
 
     if args.output:
-        args.output.write_text(output_text, encoding="utf-8")
+        args.output.write_text(repaired_text, encoding="utf-8")
     else:
-        print(output_text, end="" if output_text.endswith("\n") else "\n")
+        print(repaired_text, end="")
 
 
 if __name__ == "__main__":
