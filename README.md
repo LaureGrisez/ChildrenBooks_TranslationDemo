@@ -26,13 +26,54 @@ From the project root, launch one run with:
 TARGET_LANGUAGES=Finnish BURR_STORAGE_DIR=/private/tmp/.burr .venv/bin/python main.py
 ```
 
+To run only the first two candidates in the default incremental order
+(`google_translation`, then `gpt4o`), use:
+
+```bash
+TARGET_LANGUAGES=Finnish MAX_PARALLEL_CANDIDATES=2 BURR_STORAGE_DIR=/private/tmp/.burr .venv/bin/python main.py
+```
+
+To choose candidates explicitly, use `CANDIDATE_NAMES`:
+
+```bash
+TARGET_LANGUAGES=Finnish CANDIDATE_NAMES=google_translation,gpt4o BURR_STORAGE_DIR=/private/tmp/.burr .venv/bin/python main.py
+```
+
+No extra flag is needed for cache-backed recovery. The workflow uses the
+response cache automatically by default.
+
+If you want to force a fresh uncached run, use:
+
+```bash
+TARGET_LANGUAGES=Finnish BURR_STORAGE_DIR=/private/tmp/.burr TRANSLATION_CACHE=0 .venv/bin/python main.py
+```
+
+To run the first multimodal configuration, use:
+
+```bash
+WORKFLOW_MODE=multimodal TARGET_LANGUAGES=Finnish BURR_STORAGE_DIR=/private/tmp/.burr .venv/bin/python main.py
+```
+
 Notes:
 
 - Replace `Finnish` with any language present in `Noms barbapapas - Sheet1.csv`.
 - If `TARGET_LANGUAGES` is omitted, the workflow uses all CSV languages except `French`.
+- Candidate generation follows this default incremental order: `google_translation`, `gpt4o`, `gpt5_5`, `claude_sonnet_4_6`, `gemini_3`.
+- `MAX_PARALLEL_CANDIDATES` limits how many candidates from that order are used.
+- `CANDIDATE_NAMES` lets you choose the exact candidate set explicitly.
+- More than 3 active candidates is deprecated and not supported yet. For now, keep `MAX_PARALLEL_CANDIDATES<=3` and choose at most 3 names in `CANDIDATE_NAMES`.
 - The default source text is `l_arbre_de_barbapapa_INT.repaired.txt`.
 - Final translations are also exported as plain text under `translation/`, for example `translation/l_arbre_de_barbapapa_INT_fi.txt`.
 - Each run also writes versioned artifacts under `translation/{language_code}/{run_id}/`, including `candidates/`, the final text, and a Markdown comparison report.
+- OpenAI and external translation responses are cached under `.translation_cache/`, so rerunning the same job can recover from transient failures without recomputing earlier successful steps.
+- OpenAI calls retry transient connection/server errors automatically. You can tune this with `OPENAI_RETRY_ATTEMPTS` and `OPENAI_RETRY_BASE_DELAY_SECONDS`.
+- `WORKFLOW_MODE=text` is the default. `WORKFLOW_MODE=multimodal` switches candidate generation to spread-aligned translation using the source PDF plus local source-text context.
+- In the current multimodal version, candidate generation uses the textless spread images, while the critic and final synthesizer remain text-only.
+- In multimodal mode, each new segment also receives the previously translated target-language segment history. `TARGET_HISTORY_WINDOW=1` is the default.
+- Multimodal mode groups consecutive body pages by double-page spread. When both pages in a spread contain text, they are translated together in one multimodal call and returned in page order.
+- Multimodal mode assumes the cleaned French text has one paragraph per non-empty body page in the source PDF. For `l_arbre_de_barbapapa`, that mapping is currently valid and currently groups into 16 spread calls.
+- `SOURCE_CONTEXT_WINDOW=0` is now the default in multimodal mode, so the current French paragraph stays primary. You can raise it if you want some previous raw French context as well.
+- You can tune multimodal context with `TARGET_HISTORY_WINDOW` and `SOURCE_CONTEXT_WINDOW`, and spread rendering size with `MULTIMODAL_IMAGE_DPI`.
 - The runnable app entrypoint is `main.py`; the translation code itself lives under `src/translation/`.
 
 ## Generate A Translated PDF
@@ -107,6 +148,21 @@ python src/utils/pdf_translation_overlay.py \
 If a translation is longer than the original text, the script will try smaller
 font sizes automatically. If it still does not fit, it raises an error so you
 can inspect that page manually.
+
+## Compare Any Two Text Files
+
+To generate a Markdown report with a ROUGE-L score and a side-by-side diff for
+any two text files, run:
+
+```bash
+.venv/bin/python src/utils/text_comparison_report.py \
+  path/to/left.txt \
+  path/to/right.txt \
+  -o comparison_report.md \
+  --left-label left_version \
+  --right-label right_version \
+  --title "Left vs Right"
+```
 
 ## Access The Burr Logs
 

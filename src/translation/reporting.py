@@ -31,29 +31,20 @@ class ArtifactBundle:
 def persist_run_artifacts(
     state: dict[str, Any], config: TranslationWorkflowConfig
 ) -> ArtifactBundle:
-    """Write candidates, finals, and comparison reports to disk."""
+    """Write any available candidates, finals, and reports to disk."""
 
     bundle = ArtifactBundle()
     config.translation_output_dir.mkdir(parents=True, exist_ok=True)
 
+    candidate_translations = state.get("candidate_translations", {})
+    final_translations = state.get("final_translations", {})
     critic_reviews = state.get("critic_reviews", {})
     critic_reasoning = state.get("critic_reasoning", {})
     critic_winners = state.get("critic_winners", {})
 
-    for language, final_text in state["final_translations"].items():
-        latest_path = config.latest_translation_path(language)
-        versioned_path = config.versioned_translation_path(language)
-        latest_path.parent.mkdir(parents=True, exist_ok=True)
-        versioned_path.parent.mkdir(parents=True, exist_ok=True)
-
-        normalized_final = final_text.strip() + "\n"
-        latest_path.write_text(normalized_final, encoding="utf-8")
-        versioned_path.write_text(normalized_final, encoding="utf-8")
-        bundle.latest_final_paths[language] = latest_path
-        bundle.versioned_final_paths[language] = versioned_path
-
+    for language, candidates in candidate_translations.items():
         language_candidates = {}
-        for candidate in state["candidate_translations"].get(language, []):
+        for candidate in candidates:
             candidate_path = config.candidate_output_path(
                 language,
                 candidate["name"],
@@ -65,12 +56,24 @@ def persist_run_artifacts(
             language_candidates[candidate["name"]] = candidate_path
         bundle.candidate_paths[language] = language_candidates
 
+    for language, final_text in final_translations.items():
+        latest_path = config.latest_translation_path(language)
+        versioned_path = config.versioned_translation_path(language)
+        latest_path.parent.mkdir(parents=True, exist_ok=True)
+        versioned_path.parent.mkdir(parents=True, exist_ok=True)
+
+        normalized_final = final_text.strip() + "\n"
+        latest_path.write_text(normalized_final, encoding="utf-8")
+        versioned_path.write_text(normalized_final, encoding="utf-8")
+        bundle.latest_final_paths[language] = latest_path
+        bundle.versioned_final_paths[language] = versioned_path
+
         report_path = config.report_output_path(language)
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(
             build_translation_report(
                 language=language,
-                candidates=state["candidate_translations"].get(language, []),
+                candidates=candidate_translations.get(language, []),
                 final_text=final_text,
                 critic_review_raw=critic_reviews.get(language, ""),
                 critic_reasoning=critic_reasoning.get(language, ""),
@@ -144,6 +147,45 @@ def build_translation_report(
             "",
         ]
     )
+    return "\n".join(lines)
+
+
+def build_pairwise_comparison_report(
+    *,
+    left_label: str,
+    right_label: str,
+    left_text: str,
+    right_text: str,
+    title: str | None = None,
+) -> str:
+    """Create a Markdown report comparing any two text files."""
+
+    rouge_score = rouge_l_f1(left_text, right_text)
+    left_candidate = {"name": left_label, "text": left_text}
+
+    lines = [
+        f"# {title or 'Text Comparison Report'}",
+        "",
+        f"- Left text: `{left_label}`",
+        f"- Right text: `{right_label}`",
+        "",
+        "## ROUGE-L Similarity",
+        "",
+        f"- ROUGE-L F1: `{rouge_score:.4f}`",
+        "",
+        "## Side-By-Side Comparison",
+        "",
+        _render_side_by_side_diff(
+            left_candidate,
+            right_text,
+            right_label,
+            left_heading=left_label,
+            right_heading=right_label,
+        ),
+        "",
+        "Legend: green highlights mark unchanged spans; red highlights mark edited or replaced spans.",
+        "",
+    ]
     return "\n".join(lines)
 
 
@@ -247,7 +289,11 @@ def _render_best_candidate_remarks(
 
 
 def _render_side_by_side_diff(
-    best_candidate: dict[str, Any] | None, final_text: str, critic_winner: str
+    best_candidate: dict[str, Any] | None,
+    final_text: str,
+    critic_winner: str,
+    left_heading: str = "Best Candidate",
+    right_heading: str = "Final Translation",
 ) -> str:
     if best_candidate is None:
         return "No winning candidate text was available for diffing."
@@ -258,19 +304,25 @@ def _render_side_by_side_diff(
 
     rows = [
         "<table>",
-        "  <tr><th>Paragraph</th><th>Best Candidate</th><th>Final Translation</th></tr>",
+        (
+            "  <tr><th>Paragraph</th>"
+            f"<th>{html.escape(left_heading)}</th>"
+            f"<th>{html.escape(right_heading)}</th></tr>"
+        ),
     ]
 
     for index in range(paragraph_count):
         left = left_paragraphs[index] if index < len(left_paragraphs) else ""
         right = right_paragraphs[index] if index < len(right_paragraphs) else ""
-        ratio = SequenceMatcher(None, left, right).ratio()
+        normalized_left = _normalize_for_display_diff(left)
+        normalized_right = _normalize_for_display_diff(right)
+        ratio = SequenceMatcher(None, normalized_left, normalized_right).ratio()
         similarity = _similarity_label(ratio)
         rows.append(
             "  <tr>"
             f"<td><strong>{index + 1}</strong><br/>{similarity}</td>"
-            f"<td>{_diff_cell(left, right, left_side=True)}</td>"
-            f"<td>{_diff_cell(left, right, left_side=False)}</td>"
+            f"<td>{_diff_cell(normalized_left, normalized_right, left_side=True)}</td>"
+            f"<td>{_diff_cell(normalized_left, normalized_right, left_side=False)}</td>"
             "</tr>"
         )
 
@@ -300,7 +352,17 @@ def _diff_cell(left: str, right: str, *, left_side: bool) -> str:
 
 
 def _display_tokens(text: str) -> list[str]:
-    return re.findall(r"\S+\s*", text, flags=re.UNICODE)
+    return re.findall(r"\w+|[^\w\s]|\s+", text, flags=re.UNICODE)
+
+
+def _normalize_for_display_diff(text: str) -> str:
+    """Remove whitespace-only noise so red highlights stay meaningful."""
+
+    normalized = text.replace("\r\n", "\n")
+    normalized = re.sub(r"[ \t]+\n", "\n", normalized)
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
 
 
 def _wrap_tokens(tokens: list[str], color: str) -> str:

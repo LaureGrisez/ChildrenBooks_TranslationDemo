@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .glossary import CharacterGlossary
+from .segmentation import SpreadSegment
 
 
 def translation_prompt(
@@ -106,6 +107,66 @@ Source text in {source_language}:
 
 Candidates:
 {candidate_blocks}
+"""
+
+
+def segmented_translation_prompt(
+    segment: SpreadSegment,
+    source_language: str,
+    target_language: str,
+    stance: str,
+    glossary: CharacterGlossary,
+    total_segments: int,
+    previous_translated_segments: list[str] | None = None,
+    spread_pages: tuple[int, ...] | None = None,
+) -> str:
+    """Prompt for one spread-aligned translation segment."""
+
+    spread_label = ""
+    if spread_pages:
+        spread_label = (
+            f"\nCurrent spread pages: {', '.join(str(page) for page in spread_pages)}"
+        )
+
+    previous_source_context = segment.previous_source_text.strip()
+    previous_translated_context = "\n\n".join(previous_translated_segments or []).strip()
+
+    return f"""
+You are translating one double-page spread segment of a Barbapapa children's book from {source_language} into {target_language}.{spread_label}
+
+Audience and style:
+- Children aged 5-8
+- Warm, simple, playful
+- Easy to read aloud
+- Preserve paragraph breaks and quoted speech
+- Keep at best the original line breaks
+- Stay faithful to the source scene and tone
+- Do not add explanations, notes, or Markdown
+
+Language guidance:
+- Use natural modern {target_language}
+- Avoid overly formal wording
+- Keep repetitions and rhythms that work well in read-aloud storytelling
+
+Translator stance:
+- {stance}
+
+Character and side-character names:
+{glossary.format_name_guidance(target_language)}
+
+Book context:
+- Segment {segment.index + 1} of {total_segments}
+- Previously translated segments in {target_language}:
+{previous_translated_context or "(none)"}
+
+- Previous source context in {source_language}:
+{previous_source_context or "(none)"}
+
+Current source pages in {source_language}:
+{segment.source_text}
+
+Return only the translation of the current source pages in {target_language}.
+If the current spread contains text from two body pages, keep the two translated page blocks in order and separate them with one blank line.
 """
 
 
