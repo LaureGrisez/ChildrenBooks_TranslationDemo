@@ -51,8 +51,7 @@ def persist_run_artifacts(
                 candidate.get("model", "unknown"),
             )
             candidate_path.parent.mkdir(parents=True, exist_ok=True)
-            candidate_text = candidate.get("text") or candidate.get("error") or ""
-            candidate_path.write_text(candidate_text.strip() + "\n", encoding="utf-8")
+            _write_candidate_artifact(candidate_path, candidate)
             language_candidates[candidate["name"]] = candidate_path
         bundle.candidate_paths[language] = language_candidates
 
@@ -85,6 +84,20 @@ def persist_run_artifacts(
         bundle.report_paths[language] = report_path
 
     return bundle
+
+
+def _write_candidate_artifact(candidate_path: Path, candidate: dict[str, Any]) -> None:
+    """Write one candidate file without clobbering valid content with blanks."""
+
+    candidate_text = candidate.get("text") or candidate.get("error") or ""
+    normalized = candidate_text.strip()
+
+    if not normalized and candidate_path.exists():
+        existing = candidate_path.read_text(encoding="utf-8").strip()
+        if existing:
+            return
+
+    candidate_path.write_text(normalized + "\n", encoding="utf-8")
 
 
 def build_translation_report(

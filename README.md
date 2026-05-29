@@ -76,6 +76,75 @@ Notes:
 - You can tune multimodal context with `TARGET_HISTORY_WINDOW` and `SOURCE_CONTEXT_WINDOW`, and spread rendering size with `MULTIMODAL_IMAGE_DPI`.
 - The runnable app entrypoint is `main.py`; the translation code itself lives under `src/translation/`.
 
+## Workflow Walkthrough
+
+The runnable script is `main.py`. It loads configuration from environment
+variables, builds the Burr application from `src/translation/workflow.py`, runs
+the workflow, saves artifacts under `translation/`, and prints the results.
+
+The workflow has the same high-level stages in both modes:
+
+1. `generate_candidates`
+2. `critique_candidates`
+3. `summarize_critic`
+4. `generate_final_text`
+
+### Text Mode
+
+`WORKFLOW_MODE=text` is the default.
+
+In this mode:
+
+- the full repaired French text is sent as one unit
+- each active candidate generates one full-book translation
+- OpenAI candidates use the translation prompt plus glossary guidance
+- external baselines such as Google Translate are called as text-only candidates
+- the critic compares the candidate full translations paragraph by paragraph
+- the critic summary is then passed to the final synthesizer
+- the final synthesizer produces one coherent final translation for the whole book
+
+So text mode is:
+
+- one candidate call per candidate per language
+- one critic call per language
+- one critic-summary call per language
+- one final-synthesis call per language
+
+### Multimodal Mode
+
+`WORKFLOW_MODE=multimodal` switches candidate generation to spread-level
+translation while keeping the critic and final synthesizer text-only.
+
+In this mode:
+
+- the cleaned French text is first aligned to non-empty body pages in the source PDF
+- consecutive body pages are grouped by double-page spread
+- for each spread, the workflow renders one textless spread image from the source PDF
+- each candidate translates one spread at a time instead of the whole book at once
+- the prompt for a spread includes:
+  - the current spread French text
+  - glossary guidance
+  - the previous translated target-language spread history
+  - optional previous raw French context depending on `SOURCE_CONTEXT_WINDOW`
+  - the current textless spread image for multimodal-capable providers
+- if both pages of a spread contain text, they are translated together in one call and returned in page order, separated by a blank line
+- after all spread translations are generated, they are stitched back together into one candidate text per language
+- from that point on, the critic, critic summary, and final synthesizer work the same way as in text mode
+
+So multimodal mode is:
+
+- multiple spread-level candidate calls per candidate per language
+- then the same critic/summary/final steps as text mode
+
+### Caching And Recovery
+
+Both modes use the same recovery mechanisms:
+
+- OpenAI and external translation responses are cached under `.translation_cache/`
+- repeated runs with the same inputs reuse cached responses when possible
+- transient OpenAI failures are retried automatically
+- partial artifacts are written to `translation/{language_code}/{run_id}/` after completed workflow steps, so candidate outputs survive later failures
+
 ## Generate A Translated PDF
 
 After producing a translated text file, you can build a translated PDF with
