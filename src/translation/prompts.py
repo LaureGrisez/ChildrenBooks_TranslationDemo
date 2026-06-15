@@ -8,6 +8,26 @@ from .glossary import CharacterGlossary
 from .segmentation import SpreadSegment
 
 
+def neutral_candidate_label(index: int) -> str:
+    """Return a stable model-facing label that hides candidate identity."""
+
+    return f"Candidate {index + 1}"
+
+
+def neutral_candidate_blocks(
+    candidates: list[dict[str, Any]], *, successful_only: bool = False
+) -> str:
+    """Format candidate texts without exposing names, providers, or models."""
+
+    return "\n\n".join(
+        f"{neutral_candidate_label(index)}\n"
+        f"Status: {candidate.get('status', 'unknown')}\n"
+        f"{candidate.get('text', '')}"
+        for index, candidate in enumerate(candidates)
+        if not successful_only or candidate.get("status") == "ok"
+    )
+
+
 def translation_prompt(
     text: str,
     source_language: str,
@@ -16,7 +36,6 @@ def translation_prompt(
     glossary: CharacterGlossary,
 ) -> str:
     """Prompt for one translation candidate."""
-
     return f"""
 You are translating a Barbapapa children's book from {source_language} into {target_language}.
 
@@ -24,7 +43,7 @@ Audience and style:
 - Children aged 5-8
 - Warm, simple, playful
 - Easy to read aloud
-- Preserve paragraph breaks and quoted speech
+- Preserve paragraph breaks and quoted speech.
 - Keep at best the original line breaks
 - Stay faithful to the source scene and tone
 - Do not add explanations, notes, or Markdown
@@ -53,18 +72,13 @@ def critic_prompt(
     glossary: CharacterGlossary,
 ) -> str:
     """Prompt for comparing candidate translations."""
-
-    candidate_blocks = "\n\n".join(
-        f"Candidate {idx + 1}: {candidate['name']} "
-        f"({candidate['provider']} / {candidate['model']} / T={candidate['temperature']})\n"
-        f"Status: {candidate['status']}\n"
-        f"{candidate['text']}"
-        for idx, candidate in enumerate(candidates)
-    )
+    candidate_blocks = neutral_candidate_blocks(candidates)
     return f"""
 You are a senior editor for translated picture books.
 
 The source language is {source_language}. The target language is {target_language}.
+Candidate identities, providers, model names, and generation settings are hidden
+to avoid bias. Refer to candidates only by the neutral labels shown below.
 Use this name guidance when checking consistency:
 {glossary.format_name_guidance(target_language)}
 
@@ -78,19 +92,19 @@ Compare the candidate translations paragraph by paragraph. Evaluate:
 
 Return valid JSON only with this shape:
 {{
-  "overall_winner": "candidate_name",
-  "ranking": ["candidate_a", "candidate_b", "candidate_c"],
+  "overall_winner": "Candidate 1",
+  "ranking": ["Candidate 1", "Candidate 2", "Candidate 3"],
   "decision_reasoning": "Explain clearly why the winning candidate wins and what tradeoffs drove the decision.",
   "paragraph_analysis": [
     {{
       "paragraph_number": 1,
-      "best_candidate": "candidate_name",
+      "best_candidate": "Candidate 1",
       "notes": "Comparison notes for this paragraph."
     }}
   ],
   "candidate_assessment": [
     {{
-      "candidate": "candidate_name",
+      "candidate": "Candidate 1",
       "strengths": ["..."],
       "weaknesses": ["..."]
     }}
@@ -140,6 +154,7 @@ Audience and style:
 - Easy to read aloud
 - Preserve paragraph breaks and quoted speech
 - Keep at best the original line breaks
+- Do not create blank lines inside one page's translated text
 - Stay faithful to the source scene and tone
 - Do not add explanations, notes, or Markdown
 
@@ -167,6 +182,7 @@ Current source pages in {source_language}:
 
 Return only the translation of the current source pages in {target_language}.
 If the current spread contains text from two body pages, keep the two translated page blocks in order and separate them with one blank line.
+The number of returned page blocks must exactly match the number of current source page blocks.
 """
 
 
@@ -176,6 +192,9 @@ def summary_prompt(target_language: str, critique: str) -> str:
     return f"""
 Summarize this translation critique for the final {target_language} translator.
 Focus on decisions, tradeoffs, and concrete revision instructions.
+Candidate identities are intentionally hidden. Refer to candidates only by the
+neutral labels present in the critique. Do not guess or mention providers,
+model names, or generation settings.
 
 Critique:
 {critique}
@@ -191,10 +210,7 @@ def final_prompt(
     glossary: CharacterGlossary,
 ) -> str:
     """Prompt for composing the final translation."""
-
-    candidate_blocks = "\n\n".join(
-        f"{candidate['name']}:\n{candidate['text']}" for candidate in candidates
-    )
+    candidate_blocks = neutral_candidate_blocks(candidates)
     return f"""
 Create the final {target_language} translation for a Barbapapa children's book.
 
@@ -206,12 +222,72 @@ Requirements:
 - Preserve paragraph breaks and quoted speech
 - Keep at best the original line breaks
 - Keep the tone warm, clear, and easy to read aloud
+- Treat candidate labels as neutral references; do not infer quality from order
 - Return only the final translation as plain text
 
 Source text in {source_language}:
 {text}
 
 Candidate translations:
+{candidate_blocks}
+
+Critic summary:
+{critique_summary}
+"""
+
+
+def aligned_final_paragraph_prompt(
+    *,
+    source_paragraph: str,
+    previous_source: str,
+    next_source: str,
+    previous_final: str,
+    source_language: str,
+    target_language: str,
+    candidates: list[dict[str, Any]],
+    critique_summary: str,
+    glossary: CharacterGlossary,
+    paragraph_number: int,
+    paragraph_count: int,
+) -> str:
+    """Prompt for one page-aligned final paragraph in multimodal single mode."""
+
+    candidate_blocks = neutral_candidate_blocks(candidates, successful_only=True)
+    return f"""
+Create only paragraph {paragraph_number} of {paragraph_count} for the final
+{target_language} translation of this children's book.
+
+The current source paragraph corresponds to exactly one text-bearing PDF page.
+Return exactly one paragraph. Do not include blank lines, paragraph labels,
+Markdown, commentary, previous paragraphs, or following paragraphs.
+
+Requirements:
+- Translate only the current {source_language} source paragraph
+- Use the candidate books and critic summary as editorial references
+- Preserve every action, quote, speaker, and required character name
+- Keep the tone warm, natural, and easy to read aloud
+- Maintain continuity with the previous final paragraph
+- The candidate books were generated with spread images. Preserve visible
+  actions and scene details supported by the candidates and source, but do not
+  invent details merely because they appear in only one candidate.
+- Treat candidate labels as neutral references; do not infer quality from order
+
+Required character names:
+{glossary.format_name_guidance(target_language)}
+
+Previous source context:
+{previous_source or "(none)"}
+
+Current source paragraph:
+{source_paragraph}
+
+Next source context:
+{next_source or "(none)"}
+
+Previous final target paragraph:
+{previous_final or "(none)"}
+
+Candidate translation books:
 {candidate_blocks}
 
 Critic summary:

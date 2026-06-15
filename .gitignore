@@ -12,3 +12,7 @@ __pycache__/
 *.zip
 *.tar.gz
 credentials/
+/translation/
+.burr/
+.translation_cache/
+!requirements-ui.txt

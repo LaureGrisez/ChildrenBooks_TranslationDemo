@@ -10,7 +10,10 @@ def run() -> None:
     """Build, run, persist, and display one translation workflow execution."""
 
     app, config = build_application(TranslationWorkflowConfig.from_env())
-    _, _, final_state = app.run(halt_after=["generate_final_text"])
+    terminal_action = (
+        "repair_flagged_paragraphs" if config.is_panel_mode() else "generate_final_text"
+    )
+    _, _, final_state = app.run(halt_after=[terminal_action])
     saved_paths = save_final_translations(final_state, config)
     print_results(final_state, config, saved_paths=saved_paths)
 

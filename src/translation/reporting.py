@@ -124,20 +124,22 @@ def build_translation_report(
         f"# Translation Report: {config.book_name()} / {language}",
         "",
         f"- Run ID: `{config.run_id}`",
-        f"- Final model: `{config.openai_final_model}`",
+        f"- Final model: `{config.default_aggregation_model}`",
         f"- Critic winner: `{critic_winner}`",
         "",
         "## ROUGE-L Similarity To Final",
         "",
-        "| Candidate | Status | ROUGE-L F1 | Notes |",
-        "| --- | --- | ---: | --- |",
+        "| Candidate | Provider | Model | Status | ROUGE-L F1 | Notes |",
+        "| --- | --- | --- | --- | ---: | --- |",
     ]
 
     for candidate in candidates:
         score = rouge_l_f1(candidate.get("text", ""), final_text)
         notes = "(best candidate)" if candidate["name"] == critic_winner else ""
         lines.append(
-            f"| `{candidate['name']}` | {candidate['status']} | {score:.4f} | {notes} |"
+            f"| `{candidate['name']}` | `{candidate.get('provider', 'unknown')}` | "
+            f"`{candidate.get('model', 'unknown')}` | {candidate['status']} | "
+            f"{score:.4f} | {notes} |"
         )
 
     lines.extend(

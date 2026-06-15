@@ -1,0 +1,9 @@
+[server]
+address = "::1"
+port = 8511
+headless = true
+fileWatcherType = "poll"
+
+[browser]
+serverAddress = "[::1]"
+serverPort = 8511

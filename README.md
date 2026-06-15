@@ -15,8 +15,58 @@ Example setup:
 
 ```bash
 python3.10 -m venv .venv
-.venv/bin/python -m pip install -U pip langgraph langchain-openai agent-framework-openai burr crewai python-dotenv rich deepl google-cloud-translate pymupdf
+.venv/bin/python -m pip install -U pip openai pillow langgraph langchain-openai agent-framework-openai burr crewai python-dotenv rich deepl pymupdf
+.venv/bin/python -m pip install -r requirements-ui.txt
 ```
+
+## Run The Streamlit Test UI
+
+The Streamlit app runs the actual translation workflows and is intended for
+testing text-only, multimodal, and panel-judging behavior:
+
+```bash
+.venv/bin/streamlit run streamlit_app.py
+```
+
+The repository configures Streamlit to use:
+
+```text
+http://[::1]:8511
+```
+
+This dedicated loopback address avoids VS Code's automatic port-forwarding
+helper, which can occupy `127.0.0.1:8501` and leave `localhost:8501` loading
+indefinitely. Confirm the app server is healthy with:
+
+```bash
+curl 'http://[::1]:8511/_stcore/health'
+```
+
+It should return `ok`.
+
+The UI supports:
+
+- independently selecting text-only or multimodal candidate generation
+- independently selecting single-judge or panel-judge evaluation
+- selecting the target language from the character glossary
+- selecting two to five candidate strategies and configuring their model names
+- applying one candidate temperature to all selected candidates
+- uploading cleaned source text and, for multimodal mode, the source PDF
+- viewing the selected workflow as a Mermaid graph, with colored model-call
+  blocks and hover descriptions for every stage
+- inspecting generated candidates, per-judge panel scores, aggregate rankings,
+  audits, and targeted repairs
+- comparing candidates, pre-audit panel synthesis, and final translations using
+  the existing comparison-report code
+- downloading the final translated text
+
+Panel mode requires credentials only for the providers used by its selected
+candidates and judges. Google Translate candidates additionally require the
+existing Google Cloud translation credentials.
+
+With **Multimodal + Panel judges**, candidate models receive the rendered PDF
+spread images. The panel judges evaluate the resulting aligned candidate text;
+they do not currently receive the images.
 
 ## Run The Advanced Burr Workflow
 
@@ -54,6 +104,29 @@ To run the first multimodal configuration, use:
 WORKFLOW_MODE=multimodal TARGET_LANGUAGES=Finnish BURR_STORAGE_DIR=/private/tmp/.burr .venv/bin/python main.py
 ```
 
+To evaluate candidates with a blinded multi-model judge panel, use:
+
+```bash
+EVALUATION_MODE=panel \
+TARGET_LANGUAGES=Finnish \
+BURR_STORAGE_DIR=/private/tmp/.burr \
+.venv/bin/python main.py
+```
+
+By default, every selected LLM candidate model also acts as a judge. Google
+Translate remains a candidate only because it cannot perform structured
+judging. To override the derived judge panel from the command line, set
+`PANEL_JUDGES`, for example:
+
+```bash
+PANEL_JUDGES=openai:gpt-4o,anthropic:claude-sonnet-4-6 \
+EVALUATION_MODE=panel \
+.venv/bin/python main.py
+```
+
+Panel mode requires credentials for every selected candidate and judge provider.
+Anthropic and Gemini calls do not require their Python SDKs.
+
 Notes:
 
 - Replace `Finnish` with any language present in `Noms barbapapas - Sheet1.csv`.
@@ -61,13 +134,27 @@ Notes:
 - Candidate generation follows this default incremental order: `google_translation`, `gpt4o`, `gpt5_5`, `claude_sonnet_4_6`, `gemini_3`.
 - `MAX_PARALLEL_CANDIDATES` limits how many candidates from that order are used.
 - `CANDIDATE_NAMES` lets you choose the exact candidate set explicitly.
-- More than 3 active candidates is deprecated and not supported yet. For now, keep `MAX_PARALLEL_CANDIDATES<=3` and choose at most 3 names in `CANDIDATE_NAMES`.
+- `claude_sonnet_4_6` is an Anthropic candidate and requires `ANTHROPIC_API_KEY`. In multimodal mode, its spread request includes the rendered image.
+- Up to five unique built-in candidate strategies are supported: Google
+  Translate, two OpenAI strategies, Anthropic Sonnet, and Google Gemini.
 - The default source text is `l_arbre_de_barbapapa_INT.repaired.txt`.
 - Final translations are also exported as plain text under `translation/`, for example `translation/l_arbre_de_barbapapa_INT_fi.txt`.
 - Each run also writes versioned artifacts under `translation/{language_code}/{run_id}/`, including `candidates/`, the final text, and a Markdown comparison report.
 - OpenAI and external translation responses are cached under `.translation_cache/`, so rerunning the same job can recover from transient failures without recomputing earlier successful steps.
 - OpenAI calls retry transient connection/server errors automatically. You can tune this with `OPENAI_RETRY_ATTEMPTS` and `OPENAI_RETRY_BASE_DELAY_SECONDS`.
 - `WORKFLOW_MODE=text` is the default. `WORKFLOW_MODE=multimodal` switches candidate generation to spread-aligned translation using the source PDF plus local source-text context.
+- `EVALUATION_MODE=single` is the default and preserves the existing critic, critic-summary, and full-book final synthesis stages.
+- `EVALUATION_MODE=panel` performs exact paragraph alignment, independently blinded multi-family judging, deterministic aggregation, sequential paragraph synthesis, a whole-book consistency audit, and targeted repairs.
+- Panel artifacts are written under `translation/{language_code}/{run_id}/panel/`, including alignment, private mappings, raw judge results, aggregates, audit findings, and repairs.
+- When `PANEL_JUDGES` is omitted, panel judges are derived from the selected LLM candidates. The Streamlit panel-judging mode shows this default as editable judge rows, with a judge count plus provider and model fields.
+- The Streamlit judge block mirrors candidate configuration: judge count, one shared judge temperature, and one model-selection row per judge. Google Translate is excluded from judge choices.
+- `PANEL_JUDGE_TEMPERATURE` controls all panel judgment calls from the command line and defaults to `0.1`.
+- A panel must contain at least two distinct judge models. `PANEL_JUDGES` overrides the candidate-derived default; supported judge providers are `openai`, `anthropic`, and `gemini`.
+- Gemini candidates and judges use `GEMINI_API_KEY` or `GOOGLE_API_KEY`. The default model is `gemini-2.5-flash`; override it with `GEMINI_MODEL` or the Streamlit model field.
+- `DEFAULT_CRITIC_MODEL`, `DEFAULT_AGGREGATION_MODEL`, and `DEFAULT_CRITIC_SUMMARIZER_MODEL` accept `provider:model` values. Bare model names remain compatible and default to OpenAI.
+- `DEFAULT_CRITIC_MODEL` controls the single critic and panel whole-book audit. `DEFAULT_AGGREGATION_MODEL` controls final synthesis and targeted repairs; panel score aggregation itself remains deterministic. `DEFAULT_CRITIC_SUMMARIZER_MODEL` controls the single-mode critic-summary call.
+- Panel aggregation defaults to 45% pairwise results, 35% ranking position, and 20% normalized criterion scores. Configure these with `PANEL_PAIRWISE_WEIGHT`, `PANEL_RANKING_WEIGHT`, and `PANEL_SCORE_WEIGHT`; they must sum to `1.0`.
+- Panel mode uses strict paragraph alignment. It stops with an explicit error when a successful candidate does not preserve the source paragraph count.
 - In the current multimodal version, candidate generation uses the textless spread images, while the critic and final synthesizer remain text-only.
 - In multimodal mode, each new segment also receives the previously translated target-language segment history. `TARGET_HISTORY_WINDOW=1` is the default.
 - Multimodal mode groups consecutive body pages by double-page spread. When both pages in a spread contain text, they are translated together in one multimodal call and returned in page order.
@@ -75,6 +162,92 @@ Notes:
 - `SOURCE_CONTEXT_WINDOW=0` is now the default in multimodal mode, so the current French paragraph stays primary. You can raise it if you want some previous raw French context as well.
 - You can tune multimodal context with `TARGET_HISTORY_WINDOW` and `SOURCE_CONTEXT_WINDOW`, and spread rendering size with `MULTIMODAL_IMAGE_DPI`.
 - The runnable app entrypoint is `main.py`; the translation code itself lives under `src/translation/`.
+
+## Test Multimodal Image Understanding
+
+To evaluate whether the multimodal models understand the visible action in one
+double-page spread with only minimal book context, run:
+
+```bash
+.venv/bin/python test/multimodal_action_summary.py \
+  --spread-pages 10,11 \
+  --models gpt-4o,gpt-5.5 \
+  --detail low \
+  --dpi 110 \
+  --save-input-image
+```
+
+This test:
+
+- renders the requested PDF spread as a textless image
+- sends a minimal Barbapapa context as the system prompt
+- asks each listed model for a short action summary
+- writes a Markdown report under `translation/_multimodal_debug/evals/`
+
+The default system prompt lives in:
+
+```text
+test/prompts/multimodal_action_summary_system_prompt.txt
+```
+
+There is also a richer character-aware variant that keeps the original minimal
+prompt intact for comparison:
+
+```text
+test/prompts/multimodal_action_summary_system_prompt_with_characters.txt
+```
+
+For a more narrative, translator-oriented version that pushes the model toward
+actions, interactions, and transformations, use:
+
+```text
+test/prompts/multimodal_action_summary_system_prompt_narrative_focus.txt
+```
+
+You can edit that file directly, or point to another prompt file:
+
+```bash
+.venv/bin/python test/multimodal_action_summary.py \
+  --spread-pages 10,11 \
+  --models gpt-4o,gpt-5.5 \
+  --system-prompt-file path/to/your_prompt.txt
+```
+
+Example with the richer Barbapapa family context:
+
+```bash
+.venv/bin/python test/multimodal_action_summary.py \
+  --spread-pages 10,11 \
+  --models gpt-4o,gpt-5.5 \
+  --system-prompt-file test/prompts/multimodal_action_summary_system_prompt_with_characters.txt
+```
+
+Example with the narrative-focused prompt:
+
+```bash
+.venv/bin/python test/multimodal_action_summary.py \
+  --spread-pages 10,11 \
+  --models gpt-4o,gpt-5.5 \
+  --system-prompt-file test/prompts/multimodal_action_summary_system_prompt_narrative_focus.txt
+```
+
+If you already have a rendered spread image and want to test that exact file,
+use `--image` instead of `--spread-pages`:
+
+```bash
+.venv/bin/python test/multimodal_action_summary.py \
+  --image translation/_multimodal_debug/20260601_135443/segment_02_pages_10-11.png \
+  --models gpt-4o,gpt-5.5 \
+  --detail high
+```
+
+Useful knobs for this evaluation:
+
+- `--detail low|high` changes the OpenAI image-detail setting without changing the image file
+- `--dpi 110` changes the rendered spread resolution when using `--spread-pages`
+- `--user-prompt "..."` lets you tighten or relax the output instruction. By default, the script asks only: `Summarize the visible action in this double-page spread.`
+- `--output path/to/report.md` writes the comparison report to a specific location
+- `--no-cache` bypasses the local response cache for a fresh rerun
 
 ## Workflow Walkthrough
 
