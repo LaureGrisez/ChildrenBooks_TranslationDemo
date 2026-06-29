@@ -58,8 +58,18 @@ class TranslationWorkflowConfig:
 
     source_language: str = "French"
     prompt_language: str = "English"
-    source_text_path: Path = DEFAULT_SOURCE_TEXT_PATH
-    source_pdf_path: Path | None = DEFAULT_SOURCE_PDF_PATH
+    source_text_path: Path = field(
+        default_factory=lambda: Path(
+            os.getenv("SOURCE_TEXT_PATH", str(DEFAULT_SOURCE_TEXT_PATH))
+        )
+    )
+    source_pdf_path: Path | None = field(
+        default_factory=lambda: (
+            Path(os.environ["SOURCE_PDF_PATH"])
+            if os.getenv("SOURCE_PDF_PATH", "").strip()
+            else DEFAULT_SOURCE_PDF_PATH
+        )
+    )
     character_names_csv: Path = DEFAULT_CHARACTER_NAMES_CSV
     translation_output_dir: Path = DEFAULT_TRANSLATION_OUTPUT_DIR
     translation_cache_dir: Path = DEFAULT_TRANSLATION_CACHE_DIR
@@ -330,10 +340,11 @@ class TranslationWorkflowConfig:
         provider, separator, model = model_ref.partition(":")
         if not separator:
             provider, model = "openai", provider
-        if provider not in {"openai", "anthropic", "gemini"} or not model.strip():
+        provider = provider.strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", provider) or not model.strip():
             raise ValueError(
-                "model references must use 'provider:model' with provider "
-                "openai, anthropic, or gemini"
+                "model references must use 'provider:model' with a valid "
+                "LiteLLM provider name"
             )
         return provider, model.strip()
 

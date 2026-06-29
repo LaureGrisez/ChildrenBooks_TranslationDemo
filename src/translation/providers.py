@@ -1,58 +1,59 @@
-"""Shared model-provider requests for panel evaluation."""
+"""Shared LiteLLM model-provider requests for translation workflows."""
 
 from __future__ import annotations
 
 import json
 import os
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from typing import Any
 
-from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI
+# Avoid an import-time network request for LiteLLM's optional pricing metadata.
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
+import litellm
 
 from .cache import ResponseCache
 from .config import TranslationWorkflowConfig
 
 
-_openai: OpenAI | None = None
+def litellm_model_name(provider: str, model: str) -> str:
+    """Return the provider-qualified model name expected by LiteLLM."""
+
+    provider = provider.strip().lower()
+    model = model.strip()
+    if not provider or not model:
+        raise ValueError("Provider and model must both be non-empty.")
+    if model.startswith(f"{provider}/"):
+        return model
+    return f"{provider}/{model}"
 
 
-def _openai_client() -> OpenAI:
-    global _openai
-    if _openai is None:
-        _openai = OpenAI()
-    return _openai
+def _message_content(
+    prompt: str,
+    image_data_urls: list[str],
+) -> str | list[dict[str, Any]]:
+    """Build provider-neutral OpenAI-format content for LiteLLM."""
 
-
-def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", **headers},
-        method="POST",
+    if not image_data_urls:
+        return prompt
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    content.extend(
+        {
+            "type": "image_url",
+            "image_url": {"url": image_url, "detail": "low"},
+        }
+        for image_url in image_data_urls
     )
-    try:
-        with urllib.request.urlopen(request, timeout=180) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        if exc.code in {408, 429} or exc.code >= 500:
-            raise urllib.error.URLError(
-                f"Provider HTTP {exc.code}: {detail}"
-            ) from exc
-        raise ValueError(f"Provider HTTP {exc.code}: {detail}") from exc
+    return content
 
 
-def _image_content(image_data_url: str) -> tuple[str, str]:
-    """Return an image media type and base64 payload from a data URL."""
+def _supports_custom_temperature(provider: str, model: str) -> bool:
+    """Return whether this model is known to accept a temperature value."""
 
-    header, separator, data = image_data_url.partition(",")
-    if not separator or not header.startswith("data:") or ";base64" not in header:
-        raise ValueError("Expected a base64 image data URL.")
-    media_type = header[5:].split(";", 1)[0]
-    return media_type, data
+    if provider.strip().lower() != "openai":
+        return True
+    normalized = model.strip().lower()
+    return not normalized.startswith(("gpt-5", "o1", "o3", "o4"))
 
 
 def _ask_provider(
@@ -61,90 +62,26 @@ def _ask_provider(
     temperature: float,
     prompt: str,
     image_data_url: str | None = None,
+    image_data_urls: list[str] | None = None,
 ) -> str:
-    if provider == "openai":
-        content: str | list[dict[str, Any]] = prompt
-        if image_data_url:
-            content = [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": image_data_url, "detail": "low"}},
-            ]
-        request: dict[str, Any] = {
-            "model": model,
-            "messages": [{"role": "user", "content": content}],
-        }
-        if not model.lower().startswith(("gpt-5", "o1", "o3", "o4")):
-            request["temperature"] = temperature
-        response = _openai_client().chat.completions.create(**request)
-        return response.choices[0].message.content or ""
+    """Call any configured provider through LiteLLM's unified interface."""
 
-    if provider == "anthropic":
-        api_key = os.environ["ANTHROPIC_API_KEY"]
-        content: str | list[dict[str, Any]] = prompt
-        if image_data_url:
-            media_type, data = _image_content(image_data_url)
-            content = [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": data,
-                    },
-                },
-                {"type": "text", "text": prompt},
-            ]
-        payload = {
-            "model": model,
-            "max_tokens": 8192,
-            "temperature": temperature,
-            "messages": [{"role": "user", "content": content}],
-        }
-        response = _post_json(
-            "https://api.anthropic.com/v1/messages",
-            payload,
-            {"x-api-key": api_key, "anthropic-version": "2023-06-01"},
-        )
-        return "".join(
-            item.get("text", "") for item in response.get("content", []) if item.get("type") == "text"
-        )
-
-    if provider == "gemini":
-        api_key = os.environ.get("GEMINI_API_KEY") or os.environ["GOOGLE_API_KEY"]
-        encoded_model = urllib.parse.quote(model, safe="")
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/{encoded_model}:"
-            f"generateContent?key={urllib.parse.quote(api_key, safe='')}"
-        )
-        parts: list[dict[str, Any]] = [{"text": prompt}]
-        if image_data_url:
-            media_type, data = _image_content(image_data_url)
-            parts.insert(
-                0,
-                {
-                    "inline_data": {
-                        "mime_type": media_type,
-                        "data": data,
-                    }
-                },
-            )
-        response = _post_json(
-            url,
+    images = image_data_urls or ([image_data_url] if image_data_url else [])
+    request: dict[str, Any] = {
+        "model": litellm_model_name(provider, model),
+        "messages": [
             {
-                "contents": [{"parts": parts}],
-                "generationConfig": {"temperature": temperature},
-            },
-            {},
-        )
-        candidates = response.get("candidates", [])
-        if not candidates:
-            raise ValueError("Gemini returned no candidates.")
-        return "".join(
-            part.get("text", "")
-            for part in candidates[0].get("content", {}).get("parts", [])
-        )
+                "role": "user",
+                "content": _message_content(prompt, images),
+            }
+        ],
+        "timeout": 180,
+    }
+    if _supports_custom_temperature(provider, model):
+        request["temperature"] = temperature
 
-    raise ValueError(f"Unsupported model provider: {provider}")
+    response = litellm.completion(**request)
+    return response.choices[0].message.content or ""
 
 
 def ask_model_with_recovery(
@@ -154,16 +91,24 @@ def ask_model_with_recovery(
     temperature: float,
     prompt: str,
     image_data_url: str | None = None,
+    image_data_urls: list[str] | None = None,
     config: TranslationWorkflowConfig,
     cache: ResponseCache,
     label: str,
 ) -> str:
-    """Call one provider with the workflow's shared cache and retry settings."""
+    """Call one LiteLLM provider with the workflow's cache and retry settings."""
+
+    if image_data_url and image_data_urls:
+        raise ValueError("Use either image_data_url or image_data_urls, not both.")
 
     cache_prompt = prompt
-    if image_data_url:
+    if image_data_url or image_data_urls:
         cache_prompt = json.dumps(
-            {"prompt": prompt, "image_data_url": image_data_url},
+            {
+                "prompt": prompt,
+                "image_data_urls": image_data_urls
+                or ([image_data_url] if image_data_url else []),
+            },
             ensure_ascii=False,
             sort_keys=True,
         )
@@ -178,10 +123,12 @@ def ask_model_with_recovery(
             return cached
 
     retryable = (
-        APIConnectionError,
-        APITimeoutError,
-        InternalServerError,
-        urllib.error.URLError,
+        litellm.APIConnectionError,
+        litellm.BadGatewayError,
+        litellm.InternalServerError,
+        litellm.RateLimitError,
+        litellm.ServiceUnavailableError,
+        litellm.Timeout,
         TimeoutError,
     )
     last_error: Exception | None = None
@@ -193,6 +140,7 @@ def ask_model_with_recovery(
                 temperature,
                 prompt,
                 image_data_url=image_data_url,
+                image_data_urls=image_data_urls,
             )
             if config.enable_cache:
                 cache.set(

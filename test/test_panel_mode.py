@@ -166,6 +166,12 @@ class ContractAndConfigTests(unittest.TestCase):
             config.panel_judge_specs(),
         )
 
+    def test_accepts_additional_litellm_provider_references(self) -> None:
+        self.assertEqual(
+            ("zai", "glm-4.5"),
+            TranslationWorkflowConfig.parse_model_ref("ZAI:glm-4.5"),
+        )
+
     def test_ui_config_maps_panel_mode_and_language(self) -> None:
         config = build_ui_config(
             generation_mode_label="Text only",
@@ -262,6 +268,7 @@ class ContractAndConfigTests(unittest.TestCase):
 
         config = TranslationWorkflowConfig(
             max_parallel_candidates=5,
+            gemini_model="gemini-2.5-flash",
             candidate_names=[
                 "google_translation",
                 "gpt4o",
@@ -306,6 +313,8 @@ class ContractAndConfigTests(unittest.TestCase):
             source_path.write_text("Source paragraph.", encoding="utf-8")
             config = TranslationWorkflowConfig(
                 source_text_path=source_path,
+                source_pdf_path=None,
+                workflow_mode="text",
                 target_languages=["Finnish"],
                 evaluation_mode="panel",
                 candidate_names=["google_translation", "gpt4o", "gpt5_5"],
@@ -346,6 +355,18 @@ class ContractAndConfigTests(unittest.TestCase):
         self.assertEqual(
             ("gemini", "gemini-test"), config.critic_summarizer_model_spec()
         )
+
+    def test_source_paths_can_be_loaded_from_environment(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "SOURCE_TEXT_PATH": "/tmp/source.txt",
+                "SOURCE_PDF_PATH": "/tmp/source.pdf",
+            },
+        ):
+            config = TranslationWorkflowConfig()
+        self.assertEqual(Path("/tmp/source.txt"), config.source_text_path)
+        self.assertEqual(Path("/tmp/source.pdf"), config.source_pdf_path)
 
     def test_bare_default_model_remains_an_openai_model(self) -> None:
         self.assertEqual(
@@ -672,6 +693,76 @@ class AnthropicCandidateTests(unittest.TestCase):
             image_data_url, ask_model.call_args.kwargs["image_data_url"]
         )
 
+    def test_multimodal_model_translates_each_page_with_spread_image(self) -> None:
+        from src.translation.cache import ResponseCache
+        from src.translation.glossary import load_character_glossary
+        from src.translation.segmentation import SpreadSegment
+        from src.translation.workflow import (
+            CandidateSpec,
+            SegmentImageInput,
+            run_candidate,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TranslationWorkflowConfig(
+                workflow_mode="multimodal",
+                translation_cache_dir=Path(temp_dir) / "cache",
+            )
+            glossary = load_character_glossary(config.character_names_csv)
+            segment = SpreadSegment(
+                index=0,
+                spread_pages=(10, 11),
+                page_numbers=(10, 11),
+                page_texts=("First source page.", "Second source page."),
+                previous_source_text="",
+            )
+            image_data_url = "data:image/jpeg;base64,YWJj"
+            with patch(
+                "src.translation.workflow.ask_model_with_recovery",
+                side_effect=[
+                    "First translated page.\n\nAccidental internal break.",
+                    "Second translated page.",
+                ],
+            ) as ask_model:
+                candidate = run_candidate(
+                    CandidateSpec(
+                        name="gemini",
+                        provider="gemini",
+                        model="gemini-test",
+                        temperature=0.4,
+                        stance="Natural.",
+                    ),
+                    segment.source_text,
+                    "French",
+                    "English",
+                    glossary,
+                    config,
+                    ResponseCache(config.translation_cache_dir),
+                    [segment],
+                    {
+                        0: SegmentImageInput(
+                            spread_pages=(10, 11),
+                            data_url=image_data_url,
+                        )
+                    },
+                )
+
+        self.assertEqual("ok", candidate.status)
+        self.assertEqual(
+            "First translated page. Accidental internal break.\n\n"
+            "Second translated page.",
+            candidate.text,
+        )
+        self.assertEqual(2, ask_model.call_count)
+        self.assertEqual(
+            image_data_url,
+            ask_model.call_args_list[0].kwargs["image_data_url"],
+        )
+        self.assertEqual(
+            image_data_url,
+            ask_model.call_args_list[1].kwargs["image_data_url"],
+        )
+
     def test_multimodal_google_batches_page_paragraphs_with_boundaries(self) -> None:
         from src.translation.cache import ResponseCache
         from src.translation.glossary import load_character_glossary
@@ -819,6 +910,9 @@ class PanelWorkflowTests(unittest.TestCase):
             source_path.write_text("Source.", encoding="utf-8")
             config = TranslationWorkflowConfig(
                 source_text_path=source_path,
+                source_pdf_path=None,
+                workflow_mode="text",
+                evaluation_mode="single",
                 translation_output_dir=root / "translation",
                 translation_cache_dir=root / "cache",
                 burr_storage_dir=str(root / "burr"),
@@ -881,6 +975,8 @@ class PanelWorkflowTests(unittest.TestCase):
             source_path.write_text("First source.\n\nSecond source.", encoding="utf-8")
             config = TranslationWorkflowConfig(
                 source_text_path=source_path,
+                source_pdf_path=None,
+                workflow_mode="text",
                 translation_output_dir=root / "translation",
                 translation_cache_dir=root / "cache",
                 burr_storage_dir=str(root / "burr"),

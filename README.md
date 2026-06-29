@@ -15,7 +15,7 @@ Example setup:
 
 ```bash
 python3.10 -m venv .venv
-.venv/bin/python -m pip install -U pip openai pillow langgraph langchain-openai agent-framework-openai burr crewai python-dotenv rich deepl pymupdf
+.venv/bin/python -m pip install -U pip litellm openai pillow langgraph langchain-openai agent-framework-openai burr crewai python-dotenv rich deepl pymupdf
 .venv/bin/python -m pip install -r requirements-ui.txt
 ```
 
@@ -125,7 +125,8 @@ EVALUATION_MODE=panel \
 ```
 
 Panel mode requires credentials for every selected candidate and judge provider.
-Anthropic and Gemini calls do not require their Python SDKs.
+All LLM providers are called through LiteLLM; separate Anthropic and Gemini
+Python SDKs are not required.
 
 Notes:
 
@@ -140,8 +141,8 @@ Notes:
 - The default source text is `l_arbre_de_barbapapa_INT.repaired.txt`.
 - Final translations are also exported as plain text under `translation/`, for example `translation/l_arbre_de_barbapapa_INT_fi.txt`.
 - Each run also writes versioned artifacts under `translation/{language_code}/{run_id}/`, including `candidates/`, the final text, and a Markdown comparison report.
-- OpenAI and external translation responses are cached under `.translation_cache/`, so rerunning the same job can recover from transient failures without recomputing earlier successful steps.
-- OpenAI calls retry transient connection/server errors automatically. You can tune this with `OPENAI_RETRY_ATTEMPTS` and `OPENAI_RETRY_BASE_DELAY_SECONDS`.
+- LLM and external translation responses are cached under `.translation_cache/`, so rerunning the same job can recover from transient failures without recomputing earlier successful steps.
+- LiteLLM provider calls retry transient connection, rate-limit, and server errors automatically. You can tune this with `OPENAI_RETRY_ATTEMPTS` and `OPENAI_RETRY_BASE_DELAY_SECONDS`; the legacy variable names are retained for compatibility.
 - `WORKFLOW_MODE=text` is the default. `WORKFLOW_MODE=multimodal` switches candidate generation to spread-aligned translation using the source PDF plus local source-text context.
 - `EVALUATION_MODE=single` is the default and preserves the existing critic, critic-summary, and full-book final synthesis stages.
 - `EVALUATION_MODE=panel` performs exact paragraph alignment, independently blinded multi-family judging, deterministic aggregation, sequential paragraph synthesis, a whole-book consistency audit, and targeted repairs.
@@ -149,7 +150,7 @@ Notes:
 - When `PANEL_JUDGES` is omitted, panel judges are derived from the selected LLM candidates. The Streamlit panel-judging mode shows this default as editable judge rows, with a judge count plus provider and model fields.
 - The Streamlit judge block mirrors candidate configuration: judge count, one shared judge temperature, and one model-selection row per judge. Google Translate is excluded from judge choices.
 - `PANEL_JUDGE_TEMPERATURE` controls all panel judgment calls from the command line and defaults to `0.1`.
-- A panel must contain at least two distinct judge models. `PANEL_JUDGES` overrides the candidate-derived default; supported judge providers are `openai`, `anthropic`, and `gemini`.
+- A panel must contain at least two distinct judge models. `PANEL_JUDGES` overrides the candidate-derived default and accepts LiteLLM `provider:model` references such as `openai:gpt-4o`, `anthropic:claude-sonnet-4-6`, or `zai:glm-4.5`.
 - Gemini candidates and judges use `GEMINI_API_KEY` or `GOOGLE_API_KEY`. The default model is `gemini-2.5-flash`; override it with `GEMINI_MODEL` or the Streamlit model field.
 - `DEFAULT_CRITIC_MODEL`, `DEFAULT_AGGREGATION_MODEL`, and `DEFAULT_CRITIC_SUMMARIZER_MODEL` accept `provider:model` values. Bare model names remain compatible and default to OpenAI.
 - `DEFAULT_CRITIC_MODEL` controls the single critic and panel whole-book audit. `DEFAULT_AGGREGATION_MODEL` controls final synthesis and targeted repairs; panel score aggregation itself remains deterministic. `DEFAULT_CRITIC_SUMMARIZER_MODEL` controls the single-mode critic-summary call.
@@ -249,6 +250,107 @@ Useful knobs for this evaluation:
 - `--output path/to/report.md` writes the comparison report to a specific location
 - `--no-cache` bypasses the local response cache for a fresh rerun
 
+## Try Single-Page French Preprocessing
+
+The standalone preprocessing experiment adapts the original French text from
+double-page composition to page-by-page digital reading. It is not integrated
+into the translation pipeline.
+
+For each textless illustrated spread, it first asks the model for a conservative
+editorial plan, then writes exactly one non-empty French text block per physical
+body page. This lets it split or move existing text and add short transitions,
+descriptions, or suspense where a formerly silent page would otherwise read
+awkwardly.
+
+Run a small two-spread trial first:
+
+```bash
+.venv/bin/python -m src.translation.preprocessing \
+  --model openai:gpt-4o \
+  --max-spreads 2 \
+  --save-images \
+  --render-pdf
+```
+
+Try the story-aware variant on the same first two spreads:
+
+```bash
+.venv/bin/python -m src.translation.preprocessing \
+  --mode story \
+  --model openai:gpt-4o \
+  --max-spreads 2 \
+  --story-spreads-per-chunk 5 \
+  --save-images \
+  --render-pdf \
+  --no-cache
+```
+
+Run the complete book:
+
+```bash
+.venv/bin/python -m src.translation.preprocessing \
+  --model openai:gpt-5.5
+```
+
+Run the complete book in story mode, processing five double-page spreads per
+model call:
+
+```bash
+.venv/bin/python -m src.translation.preprocessing \
+  --mode story \
+  --model openai:gpt-5.5 \
+  --story-spreads-per-chunk 5 \
+  --render-pdf
+```
+
+By default, output is written under
+`translation/_preprocessing/<timestamp>/`. The directory contains the final
+page-aligned `.txt` file and `preprocessing_report.json`, which records the
+editorial plan, intervention, and result for each spread. Useful options:
+
+- `--source path/to/cleaned_french.txt` and `--pdf path/to/book.pdf`
+- `--mode spread` for the local spread-by-spread workflow, or `--mode story`
+  for sequential story-aware chunks with bounded image context
+- `--model openai:gpt-5.5`, `anthropic:<model>`, or `gemini:<model>`
+- `--temperature 0.8` to control creative variation on models that support it
+- `--skip-first 5 --skip-last 4` to select the PDF body-page window
+- `--output path/to/result.txt` and `--artifacts-dir path/to/artifacts`
+- `--max-spreads N` for inexpensive prompt trials
+- `--story-spreads-per-chunk 5` to opt into chunking and control how many
+  double-page spreads are sent in each story-mode call; when omitted, story
+  mode keeps the original single-call behavior
+- `--save-images` to retain the exact textless spread images used by the model
+- `--no-cache` to force fresh model responses while iterating on prompts
+- `--render-pdf` to create a PDF preview containing only generated pages
+- `--pdf-output path/to/preview.pdf` to choose the rendered PDF path
+- `--render-full-pdf` to keep all original PDF pages in the preview
+- `--font-file path/to/font.ttf` if the PDF preview needs an embedded font
+
+Completed spreads are saved incrementally, so the partial text and report remain
+available if a later model response fails validation.
+
+To render an existing preprocessing text file without making any model calls:
+
+```bash
+.venv/bin/python -m src.translation.preprocessing \
+  --render-from-text translation/_preprocessing/<timestamp>/l_arbre_de_barbapapa_INT.repaired.single_page.txt \
+  --pdf-output translation/_preprocessing/<timestamp>/single_page_preview.pdf
+```
+
+For a one-spread trial, the rendered PDF contains only the generated pages,
+starting from page 6. For a two-spread trial, the preview PDF contains pages
+6-9 only; unprocessed spreads are not stored in that preview.
+
+`--mode story` partitions the complete original French text into before,
+current, and after sections for every chunk. Only the current chunk's images are
+sent. Each later chunk also receives the two previous validated page texts for
+continuity. `--max-spreads` limits the total run size, while
+`--story-spreads-per-chunk` controls the image context of each model call. If
+the latter is omitted, all selected spreads are processed in one call as before.
+Chunked calls send one textless image per physical page in output order. The
+original text remains a flat before/current/after story reference rather than
+being assigned to individual output pages.
+
 ## Workflow Walkthrough
 
 The runnable script is `main.py`. It loads configuration from environment
@@ -313,9 +415,9 @@ So multimodal mode is:
 
 Both modes use the same recovery mechanisms:
 
-- OpenAI and external translation responses are cached under `.translation_cache/`
+- LLM and external translation responses are cached under `.translation_cache/`
 - repeated runs with the same inputs reuse cached responses when possible
-- transient OpenAI failures are retried automatically
+- transient LiteLLM provider failures are retried automatically
 - partial artifacts are written to `translation/{language_code}/{run_id}/` after completed workflow steps, so candidate outputs survive later failures
 
 ## Generate A Translated PDF

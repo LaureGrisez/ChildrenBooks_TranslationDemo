@@ -10,7 +10,6 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from dotenv import load_dotenv
-from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -44,17 +43,6 @@ from .segmentation import SpreadSegment, build_spread_segments, split_source_par
 load_dotenv()
 
 console = Console()
-client: OpenAI | None = None
-
-
-def openai_client() -> OpenAI:
-    """Create the OpenAI client lazily so pure helpers do not require credentials."""
-
-    global client
-    if client is None:
-        client = OpenAI()
-    return client
-
 @dataclass(slots=True)
 class CandidateSpec:
     name: str
@@ -378,181 +366,12 @@ def build_candidate_specs(
 def candidate_judge_refs(candidate_specs: list[CandidateSpec]) -> list[str]:
     """Return unique LLM judge references derived from selected candidates."""
 
-    supported_providers = {"openai", "anthropic", "gemini"}
     refs = []
     for spec in candidate_specs:
         ref = f"{spec.provider}:{spec.model}"
-        if spec.provider in supported_providers and ref not in refs:
+        if spec.name != "google_translation" and ref not in refs:
             refs.append(ref)
     return refs
-
-
-def supports_custom_temperature(model: str) -> bool:
-    """Return whether the model accepts a temperature parameter."""
-
-    normalized = model.lower()
-    return not (
-        normalized.startswith("gpt-5")
-        or normalized.startswith("o1")
-        or normalized.startswith("o3")
-        or normalized.startswith("o4")
-    )
-
-
-def ask_openai(model: str, temperature: float, prompt: str) -> str:
-    """Send one user prompt to OpenAI."""
-
-    request = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    if supports_custom_temperature(model):
-        request["temperature"] = temperature
-
-    response = openai_client().chat.completions.create(**request)
-    return response.choices[0].message.content or ""
-
-
-def ask_openai_multimodal(
-    model: str,
-    temperature: float,
-    prompt: str,
-    image_data_url: str,
-) -> str:
-    """Send one text+image prompt to OpenAI."""
-
-    request = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": image_data_url, "detail": "low"},
-                    },
-                ],
-            }
-        ],
-    }
-    if supports_custom_temperature(model):
-        request["temperature"] = temperature
-
-    response = openai_client().chat.completions.create(**request)
-    return response.choices[0].message.content or ""
-
-
-def ask_openai_with_recovery(
-    model: str,
-    temperature: float,
-    prompt: str,
-    *,
-    config: TranslationWorkflowConfig,
-    cache: ResponseCache,
-    label: str,
-) -> str:
-    """Call OpenAI with retries and a persistent disk cache."""
-
-    if config.enable_cache:
-        cached = cache.get(
-            provider="openai",
-            model=model,
-            temperature=temperature,
-            prompt=prompt,
-        )
-        if cached is not None:
-            live_log(f"Cache hit for {label} ({model}).")
-            return cached
-
-    last_error: Exception | None = None
-    for attempt in range(1, config.openai_retry_attempts + 1):
-        try:
-            response = ask_openai(model, temperature, prompt)
-            if config.enable_cache:
-                cache.set(
-                    provider="openai",
-                    model=model,
-                    temperature=temperature,
-                    prompt=prompt,
-                    response=response,
-                    metadata={"label": label},
-                )
-            return response
-        except (APIConnectionError, APITimeoutError, InternalServerError) as exc:
-            last_error = exc
-            if attempt >= config.openai_retry_attempts:
-                break
-            delay = config.openai_retry_base_delay_seconds * attempt
-            live_log(
-                f"{label} transient OpenAI error on attempt {attempt}/"
-                f"{config.openai_retry_attempts}: {type(exc).__name__}. "
-                f"Retrying in {delay:.1f}s."
-            )
-            time.sleep(delay)
-
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError(f"OpenAI request failed unexpectedly for {label}.")
-
-
-def ask_openai_multimodal_with_recovery(
-    model: str,
-    temperature: float,
-    prompt: str,
-    *,
-    image_data_url: str,
-    config: TranslationWorkflowConfig,
-    cache: ResponseCache,
-    label: str,
-) -> str:
-    """Call OpenAI multimodal with retries and a persistent disk cache."""
-
-    cache_prompt = json.dumps(
-        {"prompt": prompt, "image_data_url": image_data_url},
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-    if config.enable_cache:
-        cached = cache.get(
-            provider="openai_multimodal",
-            model=model,
-            temperature=temperature,
-            prompt=cache_prompt,
-        )
-        if cached is not None:
-            live_log(f"Cache hit for {label} ({model}).")
-            return cached
-
-    last_error: Exception | None = None
-    for attempt in range(1, config.openai_retry_attempts + 1):
-        try:
-            response = ask_openai_multimodal(model, temperature, prompt, image_data_url)
-            if config.enable_cache:
-                cache.set(
-                    provider="openai_multimodal",
-                    model=model,
-                    temperature=temperature,
-                    prompt=cache_prompt,
-                    response=response,
-                    metadata={"label": label},
-                )
-            return response
-        except (APIConnectionError, APITimeoutError, InternalServerError) as exc:
-            last_error = exc
-            if attempt >= config.openai_retry_attempts:
-                break
-            delay = config.openai_retry_base_delay_seconds * attempt
-            live_log(
-                f"{label} transient OpenAI error on attempt {attempt}/"
-                f"{config.openai_retry_attempts}: {type(exc).__name__}. "
-                f"Retrying in {delay:.1f}s."
-            )
-            time.sleep(delay)
-
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError(f"OpenAI multimodal request failed unexpectedly for {label}.")
 
 
 def external_language_code(
@@ -773,50 +592,45 @@ def run_candidate(
                     normalize_single_paragraph(page) for page in translated_pages
                 )
             else:
-                translated_parts = []
+                translated_pages = []
                 for segment in segments:
-                    history_window = config.target_history_window
-                    previous_translated_segments = (
-                        translated_parts[-history_window:] if history_window > 0 else []
-                    )
-                    prompt = segmented_translation_prompt(
-                        segment=segment,
-                        source_language=source_language,
-                        target_language=language,
-                        stance=spec.stance,
-                        glossary=glossary,
-                        total_segments=len(segments),
-                        previous_translated_segments=previous_translated_segments,
-                        spread_pages=(
-                            segment_images[segment.index].spread_pages
-                            if segment_images and segment.index in segment_images
-                            else None
-                        ),
-                    )
-                    label = (
-                        f"{language} candidate {spec.name} segment {segment.index + 1}/"
-                        f"{len(segments)}"
-                    )
-                    if spec.provider == "openai" and segment_images and segment.index in segment_images:
-                        translated_part = ask_openai_multimodal_with_recovery(
-                            spec.model,
-                            spec.temperature,
-                            prompt,
-                            image_data_url=segment_images[segment.index].data_url,
-                            config=config,
-                            cache=cache,
-                            label=label,
+                    for page_index, page_text in enumerate(segment.page_texts):
+                        history_window = config.target_history_window
+                        previous_translated_segments = (
+                            translated_pages[-history_window:] if history_window > 0 else []
                         )
-                    elif spec.provider == "openai":
-                        translated_part = ask_openai_with_recovery(
-                            spec.model,
-                            spec.temperature,
-                            prompt,
-                            config=config,
-                            cache=cache,
-                            label=label,
+                        previous_source_parts = [
+                            segment.previous_source_text,
+                            *segment.page_texts[:page_index],
+                        ]
+                        page_segment = SpreadSegment(
+                            index=segment.index,
+                            spread_pages=segment.spread_pages,
+                            page_numbers=(segment.page_numbers[page_index],),
+                            page_texts=(page_text,),
+                            previous_source_text="\n\n".join(
+                                part for part in previous_source_parts if part.strip()
+                            ),
                         )
-                    else:
+                        prompt = segmented_translation_prompt(
+                            segment=page_segment,
+                            source_language=source_language,
+                            target_language=language,
+                            stance=spec.stance,
+                            glossary=glossary,
+                            total_segments=len(segments),
+                            previous_translated_segments=previous_translated_segments,
+                            spread_pages=(
+                                segment_images[segment.index].spread_pages
+                                if segment_images and segment.index in segment_images
+                                else None
+                            ),
+                        )
+                        label = (
+                            f"{language} candidate {spec.name} segment "
+                            f"{segment.index + 1}/{len(segments)} page "
+                            f"{page_index + 1}/{len(segment.page_texts)}"
+                        )
                         translated_part = ask_model_with_recovery(
                             provider=spec.provider,
                             model=spec.model,
@@ -832,30 +646,11 @@ def run_candidate(
                             cache=cache,
                             label=label,
                         )
-                    translated_parts.append(
-                        normalize_segment_translation(
-                            translated_part,
-                            expected_page_count=len(segment.page_texts),
+                        translated_pages.append(
+                            normalize_single_paragraph(translated_part)
                         )
-                    )
-                translated = "\n\n".join(translated_parts)
-        elif spec.provider == "openai":
-            prompt = translation_prompt(
-                text=text,
-                source_language=source_language,
-                target_language=language,
-                stance=spec.stance,
-                glossary=glossary,
-            )
-            translated = ask_openai_with_recovery(
-                spec.model,
-                spec.temperature,
-                prompt,
-                config=config,
-                cache=cache,
-                label=f"{language} candidate {spec.name}",
-            )
-        elif spec.provider in {"anthropic", "gemini"}:
+                translated = "\n\n".join(translated_pages)
+        elif spec.name != "google_translation":
             prompt = translation_prompt(
                 text=text,
                 source_language=source_language,
