@@ -34,6 +34,11 @@ from src.utils.pdf_translation_overlay import (
 
 DEFAULT_BLANK_TEXT_MARGIN_RATIO = 0.08
 DEFAULT_BLANK_TEXT_HEIGHT_RATIO = 0.24
+STORY_CONTEXT_SPREADS_BEFORE = 1
+STORY_CONTEXT_SPREADS_AFTER = 2
+STORY_PLAN_PAGES_BEFORE = 1
+STORY_PLAN_PAGES_AFTER = 2
+PREPROCESSED_SOURCE_MARKERS = (".single_page", "_single_page", ".single-page")
 
 
 @dataclass(frozen=True, slots=True)
@@ -414,7 +419,6 @@ def story_chunk_prompt(
     current_source: str,
     source_after: str,
     previous_final_pages: str,
-    next_source_preview: str,
     page_numbers: list[int],
     story_plan: dict[str, Any] | None = None,
 ) -> str:
@@ -437,15 +441,16 @@ Tu es éditrice ou éditeur narratif pour albums illustrés jeunesse. Tu adaptes
 une histoire française conçue en doubles pages vers un livre numérique où
 chaque page est lue seule.
 
-Tu travailles sur un extrait du livre, mais tu disposes du texte original
-complet, divisé ci-dessous, afin de préserver l'histoire et sa progression.
+Tu travailles sur un extrait du livre. Le texte de contexte disponible est
+divisé ci-dessous afin de préserver la continuité locale. Lorsque le plan est
+fourni, son arc global sert de référence pour la progression de l'histoire.
 
 TEXTE DE RÉFÉRENCE
 
-Voici le texte original complet. Les séparateurs délimitent la portion à
+Voici le contexte original disponible. Les séparateurs délimitent la portion à
 adapter. Les pages physiques sont indiquées explicitement pour éviter de
 déplacer par erreur un événement sur la mauvaise image. Le texte avant et le
-texte après servent uniquement de contexte.
+texte après servent uniquement de contexte local.
 
 {source_before or "(début du livre)"}
 
@@ -465,17 +470,13 @@ l'action:
 
 {previous_final_pages or "(aucune page précédente)"}
 
-APERÇU DE LA SUITE
-
-Voici le texte original de la prochaine double page. Utilise-le seulement pour
-préparer la transition et ne pas anticiper la suite:
-
-{next_source_preview or "(fin du livre)"}
-
 PLAN PAGE PAR PAGE
 
 Voici le plan éditorial verrouillé pour cette portion. Il ne contient pas le
-texte final. Il indique seulement ce que chaque page peut ou ne peut pas dire:
+texte final. La clé "pages" contient les pages à écrire. Les éventuelles clés
+"context_pages_before" et "context_pages_after" servent uniquement à comprendre
+les passages de relais: ne les réécris pas et ne déplace pas leur contenu dans
+la portion actuelle.
 
 {plan_section}
 
@@ -1007,20 +1008,84 @@ def _previous_final_context(adapted_pages: list[dict[str, Any]]) -> str:
 def _story_plan_for_pages(
     story_plan: dict[str, Any] | None,
     page_numbers: list[int],
+    *,
+    pages_before: int = STORY_PLAN_PAGES_BEFORE,
+    pages_after: int = STORY_PLAN_PAGES_AFTER,
 ) -> dict[str, Any] | None:
-    """Return the global story arc plus the locked plan entries for a chunk."""
+    """Return current plan entries plus context-only entries at chunk boundaries."""
 
     if story_plan is None:
         return None
     wanted = set(page_numbers)
+    all_pages = story_plan.get("pages", [])
+    selected_indexes = [
+        index
+        for index, page in enumerate(all_pages)
+        if page.get("page_number") in wanted
+    ]
+    if not selected_indexes:
+        return {
+            "story_arc": story_plan.get("story_arc", {}),
+            "pages": [],
+            "context_pages_before": [],
+            "context_pages_after": [],
+        }
+
+    first_index = min(selected_indexes)
+    last_index = max(selected_indexes)
     return {
         "story_arc": story_plan.get("story_arc", {}),
         "pages": [
             page
-            for page in story_plan.get("pages", [])
+            for page in all_pages
             if page.get("page_number") in wanted
         ],
+        "context_pages_before": all_pages[
+            max(0, first_index - pages_before) : first_index
+        ],
+        "context_pages_after": all_pages[
+            last_index + 1 : last_index + 1 + pages_after
+        ],
     }
+
+
+def _story_source_context(
+    all_spreads: list[SpreadSource],
+    *,
+    chunk_start: int,
+    chunk_end: int,
+    bounded: bool,
+) -> tuple[list[SpreadSource], list[SpreadSource]]:
+    """Select source context around a chunk, bounding it when a plan is available."""
+
+    if not bounded:
+        return all_spreads[:chunk_start], all_spreads[chunk_end:]
+    return (
+        all_spreads[max(0, chunk_start - STORY_CONTEXT_SPREADS_BEFORE) : chunk_start],
+        all_spreads[chunk_end : chunk_end + STORY_CONTEXT_SPREADS_AFTER],
+    )
+
+
+def validate_source_provenance(
+    source_path: Path,
+    pdf_path: Path,
+    *,
+    allow_preprocessed_source: bool,
+) -> None:
+    """Guard against accidentally adapting generated single-page artifacts again."""
+
+    suspicious = [
+        path
+        for path in (source_path, pdf_path)
+        if any(marker in path.stem.lower() for marker in PREPROCESSED_SOURCE_MARKERS)
+    ]
+    if suspicious and not allow_preprocessed_source:
+        paths = ", ".join(str(path) for path in suspicious)
+        raise ValueError(
+            "The preprocessing input appears to be an already generated single-page "
+            f"artifact: {paths}. Use the original double-page source, or pass "
+            "--allow-preprocessed-source to proceed intentionally."
+        )
 
 
 def generate_story_plan(
@@ -1131,17 +1196,17 @@ def run_story_preprocessing(
                 for page_number in page_numbers
             ]
             current_source = _page_labeled_source_blocks(chunk)
-            next_source_preview = _page_labeled_source_blocks(
-                all_spreads[chunk_end : chunk_end + 1]
+            context_before, context_after = _story_source_context(
+                all_spreads,
+                chunk_start=spread_offset,
+                chunk_end=chunk_end,
+                bounded=story_plan is not None,
             )
             prompt = story_chunk_prompt(
-                source_before=_page_labeled_source_blocks(
-                    all_spreads[:spread_offset]
-                ),
+                source_before=_page_labeled_source_blocks(context_before),
                 current_source=current_source,
-                source_after=_page_labeled_source_blocks(all_spreads[chunk_end:]),
+                source_after=_page_labeled_source_blocks(context_after),
                 previous_final_pages=_previous_final_context(adapted_pages),
-                next_source_preview=next_source_preview,
                 page_numbers=page_numbers,
                 story_plan=_story_plan_for_pages(story_plan, page_numbers),
             )
@@ -1166,11 +1231,14 @@ def run_story_preprocessing(
                 "spread_indexes": [spread.index for spread in chunk],
                 "page_numbers": page_numbers,
                 "image_format": image_format,
-                "source_before": _source_section(all_spreads[:spread_offset]),
+                "source_before": (
+                    _page_labeled_source_blocks(context_before)
+                    if args.story_spreads_per_chunk is not None
+                    else ""
+                ),
                 "current_source": current_source,
-                "source_after": _page_labeled_source_blocks(all_spreads[chunk_end:]),
-                "next_source_preview": (
-                    _page_labeled_source_blocks(all_spreads[chunk_end : chunk_end + 1])
+                "source_after": (
+                    _page_labeled_source_blocks(context_after)
                     if args.story_spreads_per_chunk is not None
                     else ""
                 ),
@@ -1241,6 +1309,12 @@ def run_preprocessing(args: argparse.Namespace) -> tuple[Path, Path]:
         )
         print(f"Saved rendered PDF: {pdf_output_path}")
         return args.render_from_text, report_path
+
+    validate_source_provenance(
+        source_path,
+        pdf_path,
+        allow_preprocessed_source=args.allow_preprocessed_source,
+    )
 
     text_pages = collect_non_empty_body_pages(pdf_path, args.skip_first, args.skip_last)
     all_spreads = build_spread_sources(source_text, body_pages, text_pages)
@@ -1447,12 +1521,20 @@ def parse_args() -> argparse.Namespace:
         default="spread",
         help=(
             "Preprocessing strategy. 'spread' adapts one spread at a time; "
-            "'story' uses full-story text context with either one image call or "
-            "parameterized chunks."
+            "'story' uses page-labelled text with either one image call or "
+            "parameterized, optionally planned chunks."
         ),
     )
     parser.add_argument("--source", type=Path, help="Cleaned French source text.")
     parser.add_argument("--pdf", type=Path, help="Source illustrated PDF.")
+    parser.add_argument(
+        "--allow-preprocessed-source",
+        action="store_true",
+        help=(
+            "Allow source files whose names indicate an existing single-page "
+            "preprocessing artifact. By default these inputs are rejected."
+        ),
+    )
     parser.add_argument(
         "--model",
         default=f"openai:{defaults.openai_adversarial_model}",

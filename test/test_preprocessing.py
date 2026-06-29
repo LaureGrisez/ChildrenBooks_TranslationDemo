@@ -25,8 +25,10 @@ from src.translation.preprocessing import (
     _source_section,
     _story_chunks,
     _story_plan_for_pages,
+    _story_source_context,
     validate_plan,
     validate_page_result,
+    validate_source_provenance,
 )
 
 
@@ -185,7 +187,6 @@ class PreprocessingTests(unittest.TestCase):
             current_source="À adapter.",
             source_after="Après.",
             previous_final_pages="PAGE 4\nTexte validé.",
-            next_source_preview="Prochaine action.",
             page_numbers=[6, 7, 8, 9],
         )
         self.assertIn("TEXTE DE RÉFÉRENCE", prompt)
@@ -195,7 +196,7 @@ class PreprocessingTests(unittest.TestCase):
         self.assertIn("FIN DE LA PORTION À ADAPTER", prompt)
         self.assertIn("Après.", prompt)
         self.assertIn("PAGE 4", prompt)
-        self.assertIn("Prochaine action.", prompt)
+        self.assertNotIn("APERÇU DE LA SUITE", prompt)
         self.assertIn("6, 7, 8, 9", prompt)
         self.assertIn("correspondent individuellement", prompt)
         self.assertIn("LOCKED", prompt)
@@ -264,19 +265,25 @@ class PreprocessingTests(unittest.TestCase):
 
         subset = _story_plan_for_pages(plan, [7])
         self.assertEqual([7], [page["page_number"] for page in subset["pages"]])
+        self.assertEqual(
+            [6],
+            [page["page_number"] for page in subset["context_pages_before"]],
+        )
+        self.assertEqual([], subset["context_pages_after"])
         prompt = story_chunk_prompt(
             source_before="",
             current_source="Sept.",
             source_after="",
             previous_final_pages="PAGE 6\nSix.",
-            next_source_preview="",
             page_numbers=[7],
             story_plan=subset,
         )
         self.assertIn("PLAN PAGE PAR PAGE", prompt)
         self.assertIn("contrainte verrouillée", prompt)
         self.assertIn("Dire sept.", prompt)
-        self.assertNotIn("Dire six.", prompt)
+        self.assertIn("Dire six.", prompt)
+        self.assertIn("context_pages_before", prompt)
+        self.assertIn("ne les réécris pas", prompt)
 
         with self.assertRaisesRegex(ValueError, "page numbers"):
             validate_story_plan({"story_arc": {}, "pages": []}, (6,))
@@ -339,6 +346,52 @@ class PreprocessingTests(unittest.TestCase):
                     {"page_number": 8, "text": "Huit."},
                 ]
             ),
+        )
+
+    def test_planned_story_context_is_bounded_around_chunk(self) -> None:
+        spreads = [
+            SpreadSource(
+                index=index,
+                pages=(PageSource(page_number=6 + index, source_text=str(index)),),
+            )
+            for index in range(7)
+        ]
+
+        before, after = _story_source_context(
+            spreads,
+            chunk_start=3,
+            chunk_end=5,
+            bounded=True,
+        )
+        self.assertEqual([2], [spread.index for spread in before])
+        self.assertEqual([5, 6], [spread.index for spread in after])
+
+        full_before, full_after = _story_source_context(
+            spreads,
+            chunk_start=3,
+            chunk_end=5,
+            bounded=False,
+        )
+        self.assertEqual([0, 1, 2], [spread.index for spread in full_before])
+        self.assertEqual([5, 6], [spread.index for spread in full_after])
+
+    def test_rejects_generated_single_page_inputs_without_override(self) -> None:
+        with self.assertRaisesRegex(ValueError, "already generated single-page"):
+            validate_source_provenance(
+                Path("book.repaired.single_page.txt"),
+                Path("book.repaired.single_page.pdf"),
+                allow_preprocessed_source=False,
+            )
+
+        validate_source_provenance(
+            Path("book.repaired.single_page.txt"),
+            Path("book.repaired.single_page.pdf"),
+            allow_preprocessed_source=True,
+        )
+        validate_source_provenance(
+            Path("book.txt"),
+            Path("book.pdf"),
+            allow_preprocessed_source=False,
         )
 
 

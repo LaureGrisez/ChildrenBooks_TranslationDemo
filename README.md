@@ -319,6 +319,12 @@ editorial plan, intervention, and result for each spread. Useful options:
 - `--story-spreads-per-chunk 5` to opt into chunking and control how many
   double-page spreads are sent in each story-mode call; when omitted, story
   mode keeps the original single-call behavior
+- `--story-planner on` to generate a page-level visual plan before writing;
+  use `--story-planner only` to inspect the plan without generating page text
+- `--planner-output path/to/plan.json` to choose where planner-only output is saved
+- `--allow-preprocessed-source` to intentionally preprocess a generated
+  `.single_page` input; these inputs are rejected by default to prevent
+  accidental second-generation drift
 - `--save-images` to retain the exact textless spread images used by the model
 - `--no-cache` to force fresh model responses while iterating on prompts
 - `--render-pdf` to create a PDF preview containing only generated pages
@@ -341,15 +347,16 @@ For a one-spread trial, the rendered PDF contains only the generated pages,
 starting from page 6. For a two-spread trial, the preview PDF contains pages
 6-9 only; unprocessed spreads are not stored in that preview.
 
-`--mode story` partitions the complete original French text into before,
-current, and after sections for every chunk. Only the current chunk's images are
-sent. Each later chunk also receives the two previous validated page texts for
-continuity. `--max-spreads` limits the total run size, while
+`--mode story` partitions the original French text into explicitly page-labelled
+sections. Only the current chunk's images are sent. Each later chunk also
+receives the two previous validated page texts for continuity. With
+`--story-planner on`, writer calls receive the global story arc, one preceding
+and two following source spreads, plus adjacent planner pages marked as
+context-only. This keeps the current images prominent without losing the chunk
+handoff. Planner-off runs retain the complete before/after source context for
+comparison. `--max-spreads` limits the total run size, while
 `--story-spreads-per-chunk` controls the image context of each model call. If
 the latter is omitted, all selected spreads are processed in one call as before.
-Chunked calls send one textless image per physical page in output order. The
-original text remains a flat before/current/after story reference rather than
-being assigned to individual output pages.
 
 ## Workflow Walkthrough
 
