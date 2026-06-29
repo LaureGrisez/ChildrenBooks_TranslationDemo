@@ -22,9 +22,11 @@ from src.translation.preprocessing import (
     story_prompt,
     validate_story_plan,
     _previous_final_context,
+    _save_page_image,
     _source_section,
     _story_chunks,
     _story_plan_for_pages,
+    _story_planner_windows,
     _story_source_context,
     validate_plan,
     validate_page_result,
@@ -231,6 +233,33 @@ class PreprocessingTests(unittest.TestCase):
         self.assertNotIn("story_beat", prompt)
         self.assertNotIn("text_budget", prompt)
 
+    def test_story_planner_prompt_separates_target_and_context_pages(self) -> None:
+        spreads = [
+            SpreadSource(
+                index=index,
+                pages=(
+                    PageSource(page_number=6 + index * 2, source_text=f"Beat {index}."),
+                    PageSource(page_number=7 + index * 2, source_text=""),
+                ),
+            )
+            for index in range(3)
+        ]
+
+        prompt = story_planner_prompt(
+            source_text="Histoire complète.",
+            spreads=spreads,
+            target_page_numbers=[8, 9],
+        )
+
+        self.assertIn(
+            "images sont jointes individuellement dans cet ordre: "
+            "6, 7, 8, 9, 10, 11",
+            prompt,
+        )
+        self.assertIn("pages cibles suivantes: 8, 9", prompt)
+        self.assertIn("pages de contexte 6, 7, 10, 11", prompt)
+        self.assertIn("exactement une entrée pour chaque page cible", prompt)
+
     def test_validates_story_plan_and_injects_page_subset(self) -> None:
         plan = validate_story_plan(
             {
@@ -321,6 +350,53 @@ class PreprocessingTests(unittest.TestCase):
         self.assertEqual([5, 1], [len(chunk) for chunk in limited_chunks])
         with self.assertRaisesRegex(ValueError, "greater than zero"):
             _story_chunks(spreads, spreads_per_chunk=0, max_spreads=None)
+
+    def test_story_planner_windows_cover_each_target_once_with_context(self) -> None:
+        spreads = [
+            SpreadSource(
+                index=index,
+                pages=(PageSource(page_number=6 + index, source_text=str(index)),),
+            )
+            for index in range(16)
+        ]
+
+        windows = _story_planner_windows(spreads, spreads_per_call=5)
+
+        self.assertEqual([5, 5, 5, 1], [len(target) for target, _ in windows])
+        self.assertEqual([6, 7, 7, 2], [len(context) for _, context in windows])
+        self.assertEqual(
+            list(range(16)),
+            [spread.index for target, _ in windows for spread in target],
+        )
+        self.assertEqual(
+            [4, 5, 6, 7, 8, 9, 10],
+            [spread.index for spread in windows[1][1]],
+        )
+
+        with self.assertRaisesRegex(ValueError, "greater than zero"):
+            _story_planner_windows(spreads, spreads_per_call=0)
+
+    def test_planner_page_image_can_be_sent_as_compressed_jpeg(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = Path(tmpdir) / "source.pdf"
+            image_dir = Path(tmpdir) / "images"
+            document = fitz.open()
+            page = document.new_page(width=200, height=200)
+            page.draw_rect(page.rect, fill=(0.2, 0.5, 0.8))
+            document.save(pdf_path)
+            document.close()
+
+            data_url = _save_page_image(
+                pdf_path=pdf_path,
+                page_number=1,
+                dpi=72,
+                image_dir=image_dir,
+                jpeg_quality=65,
+            )
+
+            self.assertTrue(data_url.startswith("data:image/jpeg;base64,"))
+            self.assertTrue((image_dir / "page_01.jpg").is_file())
+            self.assertFalse((image_dir / "page_01.png").exists())
 
     def test_story_context_uses_original_sections_and_two_final_pages(self) -> None:
         spreads = [

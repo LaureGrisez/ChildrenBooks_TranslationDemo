@@ -321,7 +321,11 @@ without writing adapted page text:
 Planner-only mode writes `<source>.story_plan.json` and
 `preprocessing_report.json` under a new timestamped preprocessing directory.
 It uses the normal response cache. Prompt or image changes create a new cache
-key automatically, while an identical rerun reuses the cached plan.
+key automatically, while an identical rerun reuses the cached plan. By default,
+the planner processes five target spreads per call with one neighboring spread
+on each side as context, saves each validated window under `planner_windows/`,
+and merges every target page into one complete-book plan. Planner images are
+sent as compressed JPEGs to keep provider request bodies bounded.
 
 By default, output is written under
 `translation/_preprocessing/<timestamp>/`. The directory contains the final
@@ -341,6 +345,8 @@ editorial plan, intervention, and result for each spread. Useful options:
   mode keeps the original single-call behavior
 - `--story-planner on` to generate a page-level visual plan before writing;
   use `--story-planner only` to inspect the plan without generating page text
+- `--story-planner-spreads-per-call 5` to control planner request size; every
+  call also receives one adjacent spread on each side as context
 - `--planner-output path/to/plan.json` to choose where planner-only output is saved
 - `--allow-preprocessed-source` to intentionally preprocess a generated
   `.single_page` input; these inputs are rejected by default to prevent

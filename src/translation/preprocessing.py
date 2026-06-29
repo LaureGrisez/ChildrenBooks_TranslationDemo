@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 import json
 import re
 from dataclasses import asdict, dataclass
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import fitz  # PyMuPDF
+from PIL import Image
 
 from .cache import ResponseCache
 from .config import TranslationWorkflowConfig
@@ -38,6 +40,8 @@ STORY_CONTEXT_SPREADS_BEFORE = 1
 STORY_CONTEXT_SPREADS_AFTER = 2
 STORY_PLAN_PAGES_BEFORE = 1
 STORY_PLAN_PAGES_AFTER = 2
+STORY_PLANNER_CONTEXT_SPREADS = 1
+DEFAULT_STORY_PLANNER_SPREADS_PER_CALL = 5
 PREPROCESSED_SOURCE_MARKERS = (".single_page", "_single_page", ".single-page")
 
 
@@ -338,15 +342,34 @@ def story_planner_prompt(
     *,
     source_text: str,
     spreads: list[SpreadSource],
+    target_page_numbers: list[int] | None = None,
 ) -> str:
     """Prompt for a locked page-by-page planning artifact."""
 
-    page_numbers = [
+    image_page_numbers = [
         page.page_number
         for spread in spreads
         for page in spread.pages
     ]
+    page_numbers = target_page_numbers or image_page_numbers
+    image_page_list = ", ".join(
+        str(page_number) for page_number in image_page_numbers
+    )
     page_list = ", ".join(str(page_number) for page_number in page_numbers)
+    target_pages = set(page_numbers)
+    context_page_numbers = [
+        page_number
+        for page_number in image_page_numbers
+        if page_number not in target_pages
+    ]
+    context_instruction = (
+        "Les pages de contexte "
+        + ", ".join(str(page_number) for page_number in context_page_numbers)
+        + " sont jointes uniquement pour comprendre les transitions. Ne crée "
+        "aucune entrée de plan pour ces pages."
+        if context_page_numbers
+        else "Toutes les images jointes correspondent aux pages à planifier."
+    )
     return f"""
 Tu es éditrice ou éditeur narratif pour albums illustrés jeunesse.
 
@@ -384,8 +407,13 @@ Principes:
 Texte original complet:
 {source_text}
 
-Pages physiques, textes sources et images jointes:
+Pages physiques et textes sources disponibles:
 {_page_labeled_source_blocks(spreads)}
+
+Les images sont jointes individuellement dans cet ordre: {image_page_list}.
+{context_instruction}
+
+Crée le plan uniquement pour les pages cibles suivantes: {page_list}.
 
 Retourne uniquement un objet JSON valide:
 {{
@@ -408,8 +436,8 @@ Retourne uniquement un objet JSON valide:
     }}
   ]
 }}
-La liste pages doit contenir exactement une entrée pour chaque page physique,
-dans cet ordre: {page_list}.
+La liste pages doit contenir exactement une entrée pour chaque page cible, dans
+cet ordre: {page_list}.
 """.strip()
 
 
@@ -747,8 +775,9 @@ def _save_story_progress(
     _save_json(report_path, report)
 
 
-def _data_url_from_png(image_bytes: bytes) -> str:
-    return "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
+def _data_url_from_image(image_bytes: bytes, mime_type: str) -> str:
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
 
 
 def _save_page_image(
@@ -757,16 +786,31 @@ def _save_page_image(
     page_number: int,
     dpi: int,
     image_dir: Path | None,
+    jpeg_quality: int | None = None,
 ) -> str:
     image_bytes = render_spread_image_bytes(
         pdf_path=pdf_path,
         spread_pages=(page_number,),
         dpi=dpi,
     )
+    suffix = ".png"
+    mime_type = "image/png"
+    if jpeg_quality is not None:
+        output = io.BytesIO()
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image.convert("RGB").save(
+                output,
+                format="JPEG",
+                quality=jpeg_quality,
+                optimize=True,
+            )
+        image_bytes = output.getvalue()
+        suffix = ".jpg"
+        mime_type = "image/jpeg"
     if image_dir is not None:
         image_dir.mkdir(parents=True, exist_ok=True)
-        (image_dir / f"page_{page_number:02d}.png").write_bytes(image_bytes)
-    return _data_url_from_png(image_bytes)
+        (image_dir / f"page_{page_number:02d}{suffix}").write_bytes(image_bytes)
+    return _data_url_from_image(image_bytes, mime_type)
 
 
 def _blank_page_text_rect(page: fitz.Page) -> fitz.Rect:
@@ -1088,6 +1132,26 @@ def validate_source_provenance(
         )
 
 
+def _story_planner_windows(
+    spreads: list[SpreadSource],
+    *,
+    spreads_per_call: int,
+    context_spreads: int = STORY_PLANNER_CONTEXT_SPREADS,
+) -> list[tuple[list[SpreadSource], list[SpreadSource]]]:
+    """Return target windows paired with overlapping visual/source context."""
+
+    if spreads_per_call <= 0:
+        raise ValueError("story_planner_spreads_per_call must be greater than zero.")
+    windows: list[tuple[list[SpreadSource], list[SpreadSource]]] = []
+    for start in range(0, len(spreads), spreads_per_call):
+        end = min(len(spreads), start + spreads_per_call)
+        target_spreads = spreads[start:end]
+        context_start = max(0, start - context_spreads)
+        context_end = min(len(spreads), end + context_spreads)
+        windows.append((target_spreads, spreads[context_start:context_end]))
+    return windows
+
+
 def generate_story_plan(
     *,
     args: argparse.Namespace,
@@ -1100,34 +1164,81 @@ def generate_story_plan(
     cache: ResponseCache,
     artifact_dir: Path,
 ) -> dict[str, Any]:
-    """Generate the optional locked page-level plan used by story chunks."""
+    """Generate and merge bounded page-plan windows for the selected story."""
 
-    page_numbers = [
+    expected_page_numbers = [
         page.page_number
         for spread in spreads
         for page in spread.pages
     ]
     image_dir = artifact_dir / "planner_pages" if args.save_images else None
-    image_data_urls = [
-        _save_page_image(
-            pdf_path=pdf_path,
-            page_number=page_number,
-            dpi=args.dpi,
-            image_dir=image_dir,
-        )
-        for page_number in page_numbers
-    ]
-    raw = ask_model_with_recovery(
-        provider=provider,
-        model=model,
-        temperature=args.temperature,
-        prompt=story_planner_prompt(source_text=source_text, spreads=spreads),
-        image_data_urls=image_data_urls,
-        config=config,
-        cache=cache,
-        label="story preprocessing planner",
+    windows = _story_planner_windows(
+        spreads,
+        spreads_per_call=args.story_planner_spreads_per_call,
     )
-    return validate_story_plan(parse_json_object(raw), tuple(page_numbers))
+    merged_pages: list[dict[str, Any]] = []
+    story_arc: dict[str, Any] | None = None
+    window_dir = artifact_dir / "planner_windows"
+
+    for window_index, (target_spreads, context_spreads) in enumerate(windows, start=1):
+        target_page_numbers = [
+            page.page_number
+            for spread in target_spreads
+            for page in spread.pages
+        ]
+        image_page_numbers = [
+            page.page_number
+            for spread in context_spreads
+            for page in spread.pages
+        ]
+        image_data_urls = [
+            _save_page_image(
+                pdf_path=pdf_path,
+                page_number=page_number,
+                dpi=args.dpi,
+                image_dir=image_dir,
+                jpeg_quality=config.multimodal_jpeg_quality,
+            )
+            for page_number in image_page_numbers
+        ]
+        raw = ask_model_with_recovery(
+            provider=provider,
+            model=model,
+            temperature=args.temperature,
+            prompt=story_planner_prompt(
+                source_text=source_text,
+                spreads=context_spreads,
+                target_page_numbers=target_page_numbers,
+            ),
+            image_data_urls=image_data_urls,
+            config=config,
+            cache=cache,
+            label=f"story preprocessing planner window {window_index}",
+        )
+        window_plan = validate_story_plan(
+            parse_json_object(raw),
+            tuple(target_page_numbers),
+        )
+        if story_arc is None:
+            story_arc = window_plan["story_arc"]
+        merged_pages.extend(window_plan["pages"])
+        _save_json(
+            window_dir / f"window_{window_index:02d}.json",
+            {
+                "target_page_numbers": target_page_numbers,
+                "context_page_numbers": image_page_numbers,
+                "plan": window_plan,
+            },
+        )
+        print(
+            f"Planned story window {window_index}/{len(windows)}: "
+            f"pages {tuple(target_page_numbers)}"
+        )
+
+    return validate_story_plan(
+        {"story_arc": story_arc or {}, "pages": merged_pages},
+        tuple(expected_page_numbers),
+    )
 
 
 def run_story_preprocessing(
@@ -1560,6 +1671,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional story-mode page planner. 'on' generates a locked page plan "
             "before rewriting chunks; 'only' writes the planner output and stops."
+        ),
+    )
+    parser.add_argument(
+        "--story-planner-spreads-per-call",
+        type=int,
+        default=DEFAULT_STORY_PLANNER_SPREADS_PER_CALL,
+        help=(
+            "Target double-page spreads per planner call. Calls include one "
+            "neighboring spread on each side as context and are merged into a "
+            f"complete plan. Default: {DEFAULT_STORY_PLANNER_SPREADS_PER_CALL}."
         ),
     )
     parser.add_argument(
