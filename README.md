@@ -303,6 +303,26 @@ model call:
   --render-pdf
 ```
 
+Generate and inspect only the page-level story plan for the Barbapapa source,
+without writing adapted page text:
+
+```bash
+.venv/bin/python -m src.translation.preprocessing \
+  --mode story \
+  --story-planner only \
+  --source l_arbre_de_barbapapa_INT.repaired.txt \
+  --pdf flag_ship__l_arbre_de_barbapapa_INT.pdf \
+  --model openai:gpt-5.5 \
+  --skip-first 5 \
+  --skip-last 4 \
+  --save-images
+```
+
+Planner-only mode writes `<source>.story_plan.json` and
+`preprocessing_report.json` under a new timestamped preprocessing directory.
+It uses the normal response cache. Prompt or image changes create a new cache
+key automatically, while an identical rerun reuses the cached plan.
+
 By default, output is written under
 `translation/_preprocessing/<timestamp>/`. The directory contains the final
 page-aligned `.txt` file and `preprocessing_report.json`, which records the
