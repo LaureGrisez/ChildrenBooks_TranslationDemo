@@ -130,17 +130,64 @@ Python SDKs are not required.
 
 Notes:
 
+- Set `TRANSLATION_OUTPUT_DIR=client_presentation`,
+  `TRANSLATION_CACHE_DIR=client_presentation/cache`, and
+  `BURR_STORAGE_DIR=client_presentation/burr` to keep generated deliverables,
+  caches, and Burr traces together under one presentation directory.
+- Set a distinct `EXPERIMENT_NAME` for each test. Outputs are isolated under
+  `TRANSLATION_OUTPUT_DIR/<experiment_name>/`; both the convenient latest files
+  and every microsecond-stamped run remain available. Reusing an experiment
+  name only updates that experiment's latest files, never its versioned runs.
+- Presentation runs can set `REQUIRE_ORIGINAL_SOURCE=1` to reject accidental
+  `.single_page` preprocessing artifacts. Explicit `SOURCE_TEXT_PATH`,
+  `SOURCE_PDF_PATH`, `PDF_SKIP_FIRST`, `PDF_SKIP_LAST`, and `TITLE_PAGE_NUMBER`
+  command values take precedence over stale `.env` defaults.
 - Replace `Finnish` with any language present in `Noms barbapapas - Sheet1.csv`.
 - If `TARGET_LANGUAGES` is omitted, the workflow uses all CSV languages except `French`.
 - Candidate generation follows this default incremental order: `google_translation`, `gpt4o`, `gpt5_5`, `claude_sonnet_4_6`, `gemini_3`.
 - `MAX_PARALLEL_CANDIDATES` limits how many candidates from that order are used.
 - `CANDIDATE_NAMES` lets you choose the exact candidate set explicitly.
+- `TRANSLATION_PROFILE=normal|creative` switches between conservative and more
+  playful candidate prompt guidance. The creative profile must still preserve
+  every fact, action, character, and narrative intention.
+- `CANDIDATE_TEMPERATURES` sets temperatures by candidate, for example
+  `gpt5_5:1.1,claude_sonnet_4_6:0.8,gemini_3:0.8`. These values take precedence
+  over the optional global `CANDIDATE_TEMPERATURE` override.
+- `IMAGE_CONTEXT_MODE=summary` injects locked page evidence loaded from
+  `IMAGE_SUMMARIES_PATH`; `raw` attaches rendered spread images and `none` is
+  the default text-only context. When a configured summary artifact is missing,
+  it is generated automatically with `IMAGE_SUMMARY_MODEL` (default
+  `openai:gpt-4o`) at `IMAGE_SUMMARY_TEMPERATURE` (default `0.2`). Set
+  `AUTO_GENERATE_IMAGE_SUMMARIES=0` to require an existing artifact. Automatic
+  summary generation reads the original source and PDF directly; it does not
+  invoke story adaptation or rewrite the source text.
+- `EVALUATION_IMAGE_STAGES` accepts any comma-separated combination of
+  `judges,synthesis,audit`. It attaches the corresponding spread images to
+  those panel calls. Example: `EVALUATION_IMAGE_STAGES=judges,synthesis,audit`.
 - `claude_sonnet_4_6` is an Anthropic candidate and requires `ANTHROPIC_API_KEY`. In multimodal mode, its spread request includes the rendered image.
 - Up to five unique built-in candidate strategies are supported: Google
   Translate, two OpenAI strategies, Anthropic Sonnet, and Google Gemini.
 - The default source text is `l_arbre_de_barbapapa_INT.repaired.txt`.
-- Final translations are also exported as plain text under `translation/`, for example `translation/l_arbre_de_barbapapa_INT_fi.txt`.
-- Each run also writes versioned artifacts under `translation/{language_code}/{run_id}/`, including `candidates/`, the final text, and a Markdown comparison report.
+- Final translations are exported as both plain text and structured JSON under
+  `translation/`, for example `l_arbre_de_barbapapa_INT_fi.txt` and
+  `l_arbre_de_barbapapa_INT_fi.json`. The JSON preserves 1-based physical PDF
+  page indexes, spreads, blank illustrated pages, source/translated page text,
+  the translated title, character-name mappings, and generation metadata.
+- The title is extracted from the largest typography on PDF page 5 and
+  translated in a dedicated model call. Override extraction with `SOURCE_TITLE`,
+  change the page with `TITLE_PAGE_NUMBER`, or choose a model with
+  `TITLE_TRANSLATION_MODEL=provider:model`. By default it uses
+  `DEFAULT_AGGREGATION_MODEL` at `TITLE_TRANSLATION_TEMPERATURE=0.1`.
+- JSON generation validates that source paragraphs, translated paragraphs, and
+  text-bearing PDF pages have exactly matching counts. It fails explicitly
+  instead of emitting incorrectly shifted page content.
+- Each run also writes versioned artifacts under
+  `translation/{language_code}/{run_id}/`, including `candidates/`, matching
+  `.txt` and `.json` final files, and a Markdown comparison report.
+- Every run writes `model_call_metrics.json` in its versioned language
+  directory. It records cache status and call latency plus token usage and an
+  estimated USD cost when LiteLLM/provider metadata supplies them. External
+  Google Translate billing is not included.
 - LLM and external translation responses are cached under `.translation_cache/`, so rerunning the same job can recover from transient failures without recomputing earlier successful steps.
 - LiteLLM provider calls retry transient connection, rate-limit, and server errors automatically. You can tune this with `OPENAI_RETRY_ATTEMPTS` and `OPENAI_RETRY_BASE_DELAY_SECONDS`; the legacy variable names are retained for compatibility.
 - `WORKFLOW_MODE=text` is the default. `WORKFLOW_MODE=multimodal` switches candidate generation to spread-aligned translation using the source PDF plus local source-text context.
@@ -156,7 +203,9 @@ Notes:
 - `DEFAULT_CRITIC_MODEL` controls the single critic and panel whole-book audit. `DEFAULT_AGGREGATION_MODEL` controls final synthesis and targeted repairs; panel score aggregation itself remains deterministic. `DEFAULT_CRITIC_SUMMARIZER_MODEL` controls the single-mode critic-summary call.
 - Panel aggregation defaults to 45% pairwise results, 35% ranking position, and 20% normalized criterion scores. Configure these with `PANEL_PAIRWISE_WEIGHT`, `PANEL_RANKING_WEIGHT`, and `PANEL_SCORE_WEIGHT`; they must sum to `1.0`.
 - Panel mode uses strict paragraph alignment. It stops with an explicit error when a successful candidate does not preserve the source paragraph count.
-- In the current multimodal version, candidate generation uses the textless spread images, while the critic and final synthesizer remain text-only.
+- Multimodal candidate generation uses textless spread images. Panel judges,
+  synthesis, and audit can independently receive those images through
+  `EVALUATION_IMAGE_STAGES`.
 - In multimodal mode, each new segment also receives the previously translated target-language segment history. `TARGET_HISTORY_WINDOW=1` is the default.
 - Multimodal mode groups consecutive body pages by double-page spread. When both pages in a spread contain text, they are translated together in one multimodal call and returned in page order.
 - Multimodal mode assumes the cleaned French text has one paragraph per non-empty body page in the source PDF. For `l_arbre_de_barbapapa`, that mapping is currently valid and currently groups into 16 spread calls.
@@ -318,10 +367,22 @@ without writing adapted page text:
   --save-images
 ```
 
+Before the story planner runs, a dedicated `image summary` stage uses
+`openai:gpt-4o` on each complete double-page spread together with the printed
+source text assigned to both pages. It writes the spread's main action plus
+concise page-specific visual evidence to `<source>.image_summaries.json`; the
+frontier planner receives both levels as locked text input without the raw
+images, and its `visible_on_page` lists are replaced with the validated GPT-4o
+lists before the plan is saved. This keeps every vision request to one
+compressed spread and keeps the larger planner windows text-only.
+
 Planner-only mode writes `<source>.story_plan.json` and
 `preprocessing_report.json` under a new timestamped preprocessing directory.
-It uses the normal response cache. Prompt or image changes create a new cache
-key automatically, while an identical rerun reuses the cached plan. By default,
+The image-summary artifact is versioned and records its model, prompt version,
+render settings, spread page numbers, and image SHA-256 digests so it can be
+piped into the translation workflow later. Both stages use the normal response
+cache. Prompt or image changes create a new cache key automatically, while an
+identical rerun reuses the cached summaries and plan. By default,
 the planner processes five target spreads per call with one neighboring spread
 on each side as context, saves each validated window under `planner_windows/`,
 and merges every target page into one complete-book plan. Planner images are
@@ -347,6 +408,12 @@ editorial plan, intervention, and result for each spread. Useful options:
   use `--story-planner only` to inspect the plan without generating page text
 - `--story-planner-spreads-per-call 5` to control planner request size; every
   call also receives one adjacent spread on each side as context
+- `--image-summary-model openai:gpt-4o` to select the vision model independently
+  from the frontier planning/writing model
+- `--image-summaries path/to/image_summaries.json` to reuse an existing visual
+  artifact without making image-summary calls
+- `--image-summary-output path/to/image_summaries.json` to choose the reusable
+  visual artifact path
 - `--planner-output path/to/plan.json` to choose where planner-only output is saved
 - `--allow-preprocessed-source` to intentionally preprocess a generated
   `.single_page` input; these inputs are rejected by default to prevent
@@ -525,6 +592,30 @@ python src/utils/pdf_translation_overlay.py \
 If a translation is longer than the original text, the script will try smaller
 font sizes automatically. If it still does not fit, it raises an error so you
 can inspect that page manually.
+
+### Compress A PDF
+
+Compress any PDF with the standalone utility:
+
+```bash
+.venv/bin/python src/utils/pdf_compressor.py input.pdf -o output.compressed.pdf
+```
+
+It preserves searchable text and vector graphics while recompressing and
+downsampling high-resolution images. The defaults target 144 DPI at JPEG
+quality 75. Every page is rendered before and after compression; if image
+rewriting changes the page materially, the utility automatically falls back to
+safe stream-only compression. Use `--safe` to request stream-only compression
+up front. PDF generators use this safe mode automatically. For a smaller file (with more image-quality
+loss), for example:
+
+```bash
+.venv/bin/python src/utils/pdf_compressor.py input.pdf \
+  -o output.compressed.pdf --dpi 110 --dpi-threshold 140 --quality 60
+```
+
+The translated-PDF generator and preprocessing PDF preview generator run this
+compression automatically after writing their output PDFs.
 
 ## Compare Any Two Text Files
 
