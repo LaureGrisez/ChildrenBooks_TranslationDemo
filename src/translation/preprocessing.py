@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import re
@@ -11,6 +12,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 
 import fitz  # PyMuPDF
 from PIL import Image
@@ -32,6 +34,7 @@ from src.utils.pdf_translation_overlay import (
     insert_translation,
     register_font,
 )
+from src.utils.pdf_compressor import compress_pdf
 
 
 DEFAULT_BLANK_TEXT_MARGIN_RATIO = 0.08
@@ -42,6 +45,10 @@ STORY_PLAN_PAGES_BEFORE = 1
 STORY_PLAN_PAGES_AFTER = 2
 STORY_PLANNER_CONTEXT_SPREADS = 1
 DEFAULT_STORY_PLANNER_SPREADS_PER_CALL = 5
+DEFAULT_IMAGE_SUMMARY_MODEL = "openai:gpt-4o"
+DEFAULT_IMAGE_SUMMARY_TEMPERATURE = 0.2
+IMAGE_SUMMARY_SCHEMA_VERSION = 2
+IMAGE_SUMMARY_PROMPT_VERSION = "barbapapa-spread-and-visible-pages-v2"
 PREPROCESSED_SOURCE_MARKERS = (".single_page", "_single_page", ".single-page")
 
 
@@ -343,6 +350,9 @@ def story_planner_prompt(
     source_text: str,
     spreads: list[SpreadSource],
     target_page_numbers: list[int] | None = None,
+    image_summaries: dict[int, list[str]] | None = None,
+    spread_image_summaries: dict[int, str] | None = None,
+    raw_images_attached: bool = True,
 ) -> str:
     """Prompt for a locked page-by-page planning artifact."""
 
@@ -365,10 +375,55 @@ def story_planner_prompt(
     context_instruction = (
         "Les pages de contexte "
         + ", ".join(str(page_number) for page_number in context_page_numbers)
-        + " sont jointes uniquement pour comprendre les transitions. Ne crée "
+        + " sont fournies uniquement pour comprendre les transitions. Ne crée "
         "aucune entrée de plan pour ces pages."
         if context_page_numbers
-        else "Toutes les images jointes correspondent aux pages à planifier."
+        else "Toutes les pages fournies correspondent aux pages à planifier."
+    )
+    image_attachment_instruction = (
+        f"Les images sont jointes individuellement dans cet ordre: {image_page_list}."
+        if raw_images_attached
+        else (
+            "Aucune image brute n'est jointe à cet appel. Les résumés visuels "
+            "ci-dessous constituent le contexte visuel validé."
+        )
+    )
+    if image_summaries is None:
+        visual_evidence = "(aucun résumé visuel séparé fourni)"
+        visual_instruction = (
+            "Déduis visible_on_page prudemment à partir des images jointes."
+        )
+    else:
+        visual_evidence = json.dumps(
+            {
+                str(page_number): image_summaries[page_number]
+                for page_number in image_page_numbers
+                if page_number in image_summaries
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        visual_instruction = (
+            "Les RÉSUMÉS VISUELS VERROUILLÉS ont été produits séparément par "
+            "GPT-4o. Pour chaque page cible, copie exactement la liste fournie "
+            "dans visible_on_page; ne la complète pas et ne la réinterprète pas."
+        )
+    spread_visual_evidence = (
+        json.dumps(
+            [
+                {
+                    "spread_index": spread.index,
+                    "page_numbers": list(spread.page_numbers),
+                    "main_action": spread_image_summaries[spread.index],
+                }
+                for spread in spreads
+                if spread.index in spread_image_summaries
+            ],
+            ensure_ascii=False,
+            indent=2,
+        )
+        if spread_image_summaries is not None
+        else "(aucun résumé global de double page fourni)"
     )
     return f"""
 Tu es éditrice ou éditeur narratif pour albums illustrés jeunesse.
@@ -410,8 +465,15 @@ Texte original complet:
 Pages physiques et textes sources disponibles:
 {_page_labeled_source_blocks(spreads)}
 
-Les images sont jointes individuellement dans cet ordre: {image_page_list}.
+{image_attachment_instruction}
 {context_instruction}
+
+RÉSUMÉS VISUELS VERROUILLÉS, indexés par page physique:
+{visual_evidence}
+{visual_instruction}
+
+ACTIONS PRINCIPALES VERROUILLÉES, par double page:
+{spread_visual_evidence}
 
 Crée le plan uniquement pour les pages cibles suivantes: {page_list}.
 
@@ -438,6 +500,65 @@ Retourne uniquement un objet JSON valide:
 }}
 La liste pages doit contenir exactement une entrée pour chaque page cible, dans
 cet ordre: {page_list}.
+""".strip()
+
+
+def image_summary_prompt(spread: SpreadSource) -> str:
+    """Prompt GPT-4o for concise, page-specific visual evidence."""
+
+    page_list = ", ".join(str(page) for page in spread.page_numbers)
+    example_pages = ",\n".join(
+        "    {\n"
+        f'      "page_number": {page_number},\n'
+        '      "visible_on_page": ["Une phrase décrivant une action ou une scène réellement visible."]\n'
+        "    }"
+        for page_number in spread.page_numbers
+    )
+    return f"""
+You are creating visual evidence for a children's-book preprocessing workflow.
+
+Context about the book:
+- This is a Barbapapa picture book for children aged 5-8.
+- The image is one double-page spread from the book.
+- The goal is to understand the visible action so a translator can better interpret each physical page.
+
+Printed source text associated with this spread:
+{_page_source_blocks(spread)}
+
+Instructions:
+- Describe only the action and scene visible in the image.
+- Use the printed source text to understand the story context and ambiguous actions, but do not claim that a textual detail is visible unless the image supports it.
+- First summarize the main action or narrative beat across the entire spread in 2 to 3 sentences.
+- Treat physical pages {page_list} separately, from left to right.
+- Then describe the main action visible on each page in 1 to 3 concise sentences, with one sentence per visible_on_page list item.
+- Mention the main characters only if they are visually recognizable.
+- Use the character context to identify a character, but do not infer an action that is not visible.
+- If something is unclear, say so briefly instead of inventing details.
+- Do not mention page layout, OCR, prompt design, source text, or translation strategy.
+
+Book and character context:
+- The Barbapapas are shape-shifting beings who can transform into many forms to solve tricky situations.
+- Together they are a family.
+- Barbapapa is the father: a large light-pink character.
+- Barbamama is the mother: a black character with a curvier silhouette and red flowers around her head.
+- They have seven children. The boys resemble their father more, and the girls resemble their mother more.
+- Barbotine is orange, wears glasses, and loves reading.
+- Barbidur is red and athletic.
+- Barbabelle is purple and fashion-conscious.
+- Barbidou is yellow and loves animals.
+- Barbibul is blue, curious, and clever.
+- Barbouille is black, hairy, and paints.
+- Barbalala is green and loves singing.
+- Claudine and François are regular humans who join the family on some adventures.
+- Lolita is their dog.
+
+Return only this valid JSON shape, with exactly one entry for each physical page:
+{{
+  "spread_summary": "Two or three sentences describing the main action across the complete spread.",
+  "pages": [
+{example_pages}
+  ]
+}}
 """.strip()
 
 
@@ -669,6 +790,97 @@ def validate_story_plan(
     return payload
 
 
+def validate_image_summaries(
+    payload: dict[str, Any], expected_page_numbers: tuple[int, ...]
+) -> dict[int, list[str]]:
+    """Validate reusable visual evidence and return it indexed by page."""
+
+    pages = payload.get("pages")
+    if not isinstance(pages, list):
+        raise ValueError("Image summaries must contain a pages list.")
+    actual_numbers = [page.get("page_number") for page in pages if isinstance(page, dict)]
+    if actual_numbers != list(expected_page_numbers):
+        raise ValueError(
+            "Image summary page numbers must exactly match "
+            f"{list(expected_page_numbers)}; received {actual_numbers}."
+        )
+
+    summaries: dict[int, list[str]] = {}
+    for page in pages:
+        if not isinstance(page, dict):
+            raise ValueError("Every image summary page must be an object.")
+        visible = page.get("visible_on_page")
+        if not isinstance(visible, list) or not all(
+            isinstance(item, str) for item in visible
+        ):
+            raise ValueError(
+                f"Image summary page {page.get('page_number')} must contain a "
+                "visible_on_page string list."
+            )
+        normalized = [item.strip() for item in visible if item.strip()]
+        if not normalized or len(normalized) > 3:
+            raise ValueError(
+                f"Image summary page {page.get('page_number')} must contain "
+                "between one and three observations."
+            )
+        summaries[int(page["page_number"])] = normalized
+    return summaries
+
+
+def validate_spread_summary(payload: dict[str, Any]) -> str:
+    """Validate the complete-spread action summary returned by the vision model."""
+
+    summary = payload.get("spread_summary")
+    if not isinstance(summary, str) or not summary.strip():
+        raise ValueError("Image summaries must contain a non-empty spread_summary.")
+    return summary.strip()
+
+
+def spread_summaries_from_artifact(
+    payload: dict[str, Any], spreads: list[SpreadSource]
+) -> dict[int, str]:
+    """Load and validate complete-spread summaries from a reusable artifact."""
+
+    records = payload.get("spreads")
+    if not isinstance(records, list):
+        raise ValueError("Image summaries must contain a spreads list.")
+    expected = [(spread.index, list(spread.page_numbers)) for spread in spreads]
+    actual = [
+        (record.get("spread_index"), record.get("page_numbers"))
+        for record in records
+        if isinstance(record, dict)
+    ]
+    if actual != expected:
+        raise ValueError(
+            f"Image summary spreads must exactly match {expected}; received {actual}."
+        )
+    summaries: dict[int, str] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("Every image summary spread must be an object.")
+        summaries[int(record["spread_index"])] = validate_spread_summary(
+            {"spread_summary": record.get("spread_summary")}
+        )
+    return summaries
+
+
+def inject_image_summaries(
+    story_plan: dict[str, Any], image_summaries: dict[int, list[str]]
+) -> dict[str, Any]:
+    """Make reusable image evidence authoritative in a planner response."""
+
+    pages = story_plan.get("pages")
+    if not isinstance(pages, list):
+        return story_plan
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        page_number = page.get("page_number")
+        if isinstance(page_number, int) and page_number in image_summaries:
+            page["visible_on_page"] = list(image_summaries[page_number])
+    return story_plan
+
+
 def adapted_pages_from_text(
     adapted_text: str,
     body_page_numbers: list[int],
@@ -749,6 +961,7 @@ def _save_story_progress(
     temperature: float,
     spreads_per_chunk: int | None,
     story_plan: dict[str, Any] | None = None,
+    image_summary_path: Path | None = None,
 ) -> None:
     """Persist completed story chunks so a partial run remains inspectable."""
 
@@ -769,6 +982,8 @@ def _save_story_progress(
     }
     if story_plan is not None:
         report["story_plan"] = story_plan
+    if image_summary_path is not None:
+        report["image_summaries"] = str(image_summary_path)
     if spreads_per_chunk is None and len(chunk_results) == 1:
         report["page_numbers"] = chunk_results[0]["page_numbers"]
         report["story_result"] = chunk_results[0]["result"]
@@ -811,6 +1026,42 @@ def _save_page_image(
         image_dir.mkdir(parents=True, exist_ok=True)
         (image_dir / f"page_{page_number:02d}{suffix}").write_bytes(image_bytes)
     return _data_url_from_image(image_bytes, mime_type)
+
+
+def _spread_image_payload(
+    *,
+    pdf_path: Path,
+    spread: SpreadSource,
+    dpi: int,
+    jpeg_quality: int,
+    image_dir: Path | None,
+) -> tuple[str, str]:
+    """Render a spread once and return its JPEG data URL and content digest."""
+
+    png_bytes = render_spread_image_bytes(
+        pdf_path=pdf_path,
+        spread_pages=spread.page_numbers,
+        dpi=dpi,
+    )
+    output = io.BytesIO()
+    with Image.open(io.BytesIO(png_bytes)) as image:
+        image.convert("RGB").save(
+            output,
+            format="JPEG",
+            quality=jpeg_quality,
+            optimize=True,
+        )
+    image_bytes = output.getvalue()
+    if image_dir is not None:
+        image_dir.mkdir(parents=True, exist_ok=True)
+        page_slug = "-".join(str(page) for page in spread.page_numbers)
+        (image_dir / f"spread_{spread.index + 1:02d}_pages_{page_slug}.jpg").write_bytes(
+            image_bytes
+        )
+    return (
+        _data_url_from_image(image_bytes, "image/jpeg"),
+        hashlib.sha256(image_bytes).hexdigest(),
+    )
 
 
 def _blank_page_text_rect(page: fitz.Page) -> fitz.Rect:
@@ -1005,6 +1256,8 @@ def render_preprocessed_pdf(
         if selected_pages_only:
             document.close()
 
+    compress_pdf(output_path, output_path, recompress_images=False)
+
 
 def _story_chunks(
     all_spreads: list[SpreadSource],
@@ -1152,6 +1405,126 @@ def _story_planner_windows(
     return windows
 
 
+def generate_image_summaries(
+    *,
+    args: argparse.Namespace,
+    config: TranslationWorkflowConfig,
+    pdf_path: Path,
+    spreads: list[SpreadSource],
+    cache: ResponseCache,
+    artifact_dir: Path,
+) -> tuple[dict[int, list[str]], dict[int, str], dict[str, Any]]:
+    """Run the reusable GPT-4o image-summary stage over complete spreads."""
+
+    provider, model = config.parse_model_ref(args.image_summary_model)
+    expected_page_numbers = tuple(
+        page.page_number for spread in spreads for page in spread.pages
+    )
+    image_dir = artifact_dir / "image_summary_spreads" if args.save_images else None
+    pages: list[dict[str, Any]] = []
+    spread_records: list[dict[str, Any]] = []
+    spread_summaries: dict[int, str] = {}
+
+    for spread in spreads:
+        image_data_url, image_sha256 = _spread_image_payload(
+            pdf_path=pdf_path,
+            spread=spread,
+            dpi=args.dpi,
+            jpeg_quality=config.multimodal_jpeg_quality,
+            image_dir=image_dir,
+        )
+        prompt = image_summary_prompt(spread)
+        raw = ask_model_with_recovery(
+            provider=provider,
+            model=model,
+            temperature=args.image_summary_temperature,
+            prompt=prompt,
+            image_data_url=image_data_url,
+            config=config,
+            cache=cache,
+            label=f"image summary spread {spread.index + 1}",
+        )
+        response_payload = parse_json_object(raw)
+        page_summaries = validate_image_summaries(
+            response_payload, spread.page_numbers
+        )
+        spread_summary = validate_spread_summary(response_payload)
+        spread_summaries[spread.index] = spread_summary
+        pages.extend(
+            {
+                "page_number": page_number,
+                "visible_on_page": page_summaries[page_number],
+            }
+            for page_number in spread.page_numbers
+        )
+        spread_records.append(
+            {
+                "spread_index": spread.index,
+                "page_numbers": list(spread.page_numbers),
+                "image_sha256": image_sha256,
+                "spread_summary": spread_summary,
+            }
+        )
+        print(
+            f"Image summary {spread.index + 1}/{len(spreads)}: "
+            f"pages {spread.page_numbers}"
+        )
+
+    artifact = {
+        "schema_version": IMAGE_SUMMARY_SCHEMA_VERSION,
+        "prompt_version": IMAGE_SUMMARY_PROMPT_VERSION,
+        "source_pdf": str(pdf_path),
+        "model": f"{provider}:{model}",
+        "temperature": args.image_summary_temperature,
+        "render_dpi": args.dpi,
+        "jpeg_quality": config.multimodal_jpeg_quality,
+        "spreads": spread_records,
+        "pages": pages,
+    }
+    return (
+        validate_image_summaries(artifact, expected_page_numbers),
+        spread_summaries,
+        artifact,
+    )
+
+
+def ensure_workflow_image_summaries(
+    config: TranslationWorkflowConfig, output_path: Path
+) -> Path:
+    """Generate the reusable visual-evidence artifact required by text workflows."""
+
+    if output_path.is_file():
+        return output_path
+    if config.source_pdf_path is None:
+        raise ValueError("Automatic image summaries require SOURCE_PDF_PATH.")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    source_text = config.load_source_text()
+    body_pages = collect_body_pages(
+        config.source_pdf_path, config.pdf_skip_first, config.pdf_skip_last
+    )
+    text_pages = collect_non_empty_body_pages(
+        config.source_pdf_path, config.pdf_skip_first, config.pdf_skip_last
+    )
+    spreads = build_spread_sources(source_text, body_pages, text_pages)
+    args = SimpleNamespace(
+        image_summary_model=config.image_summary_model,
+        image_summary_temperature=config.image_summary_temperature,
+        dpi=config.multimodal_image_dpi,
+        save_images=config.multimodal_save_debug_images,
+    )
+    _, _, artifact = generate_image_summaries(
+        args=args,
+        config=config,
+        pdf_path=config.source_pdf_path,
+        spreads=spreads,
+        cache=ResponseCache(config.translation_cache_dir),
+        artifact_dir=output_path.parent,
+    )
+    _save_json(output_path, artifact)
+    print(f"Saved automatically generated image summaries: {output_path}")
+    return output_path
+
+
 def generate_story_plan(
     *,
     args: argparse.Namespace,
@@ -1163,6 +1536,8 @@ def generate_story_plan(
     model: str,
     cache: ResponseCache,
     artifact_dir: Path,
+    image_summaries: dict[int, list[str]] | None = None,
+    spread_image_summaries: dict[int, str] | None = None,
 ) -> dict[str, Any]:
     """Generate and merge bounded page-plan windows for the selected story."""
 
@@ -1191,16 +1566,20 @@ def generate_story_plan(
             for spread in context_spreads
             for page in spread.pages
         ]
-        image_data_urls = [
-            _save_page_image(
-                pdf_path=pdf_path,
-                page_number=page_number,
-                dpi=args.dpi,
-                image_dir=image_dir,
-                jpeg_quality=config.multimodal_jpeg_quality,
-            )
-            for page_number in image_page_numbers
-        ]
+        image_data_urls = (
+            [
+                _save_page_image(
+                    pdf_path=pdf_path,
+                    page_number=page_number,
+                    dpi=args.dpi,
+                    image_dir=image_dir,
+                    jpeg_quality=config.multimodal_jpeg_quality,
+                )
+                for page_number in image_page_numbers
+            ]
+            if image_summaries is None
+            else []
+        )
         raw = ask_model_with_recovery(
             provider=provider,
             model=model,
@@ -1209,14 +1588,23 @@ def generate_story_plan(
                 source_text=source_text,
                 spreads=context_spreads,
                 target_page_numbers=target_page_numbers,
+                image_summaries=image_summaries,
+                spread_image_summaries=spread_image_summaries,
+                raw_images_attached=image_summaries is None,
             ),
             image_data_urls=image_data_urls,
             config=config,
             cache=cache,
             label=f"story preprocessing planner window {window_index}",
         )
+        if image_summaries is not None:
+            parsed_plan = inject_image_summaries(
+                parse_json_object(raw), image_summaries
+            )
+        else:
+            parsed_plan = parse_json_object(raw)
         window_plan = validate_story_plan(
-            parse_json_object(raw),
+            parsed_plan,
             tuple(target_page_numbers),
         )
         if story_arc is None:
@@ -1255,6 +1643,7 @@ def run_story_preprocessing(
     report_path: Path,
     artifact_dir: Path,
     story_plan: dict[str, Any] | None = None,
+    image_summary_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Run sequential story-aware calls over bounded groups of spread images."""
 
@@ -1371,6 +1760,7 @@ def run_story_preprocessing(
             temperature=args.temperature,
             spreads_per_chunk=args.story_spreads_per_chunk,
             story_plan=story_plan,
+            image_summary_path=image_summary_path,
         )
         print(
             f"Adapted story chunk {chunk_index + 1}/{len(chunks)}: "
@@ -1447,12 +1837,55 @@ def run_preprocessing(args: argparse.Namespace) -> tuple[Path, Path]:
 
     if args.mode == "story":
         story_plan: dict[str, Any] | None = None
+        image_summary_path: Path | None = None
         if args.story_planner in {"on", "only"}:
             planner_spreads = (
                 all_spreads
                 if args.max_spreads is None
                 else all_spreads[: args.max_spreads]
             )
+            expected_summary_pages = tuple(
+                page.page_number
+                for spread in planner_spreads
+                for page in spread.pages
+            )
+            if args.image_summaries is not None:
+                image_summary_artifact = json.loads(
+                    args.image_summaries.read_text(encoding="utf-8")
+                )
+                if not isinstance(image_summary_artifact, dict):
+                    raise ValueError("The image summaries artifact must be a JSON object.")
+                if image_summary_artifact.get("schema_version") != IMAGE_SUMMARY_SCHEMA_VERSION:
+                    raise ValueError(
+                        "Unsupported image summaries schema_version; expected "
+                        f"{IMAGE_SUMMARY_SCHEMA_VERSION}."
+                    )
+                image_summaries = validate_image_summaries(
+                    image_summary_artifact, expected_summary_pages
+                )
+                spread_image_summaries = spread_summaries_from_artifact(
+                    image_summary_artifact, planner_spreads
+                )
+                image_summary_path = args.image_summaries
+                print(f"Loaded image summaries: {image_summary_path}")
+            else:
+                (
+                    image_summaries,
+                    spread_image_summaries,
+                    image_summary_artifact,
+                ) = generate_image_summaries(
+                    args=args,
+                    config=config,
+                    pdf_path=pdf_path,
+                    spreads=planner_spreads,
+                    cache=cache,
+                    artifact_dir=artifact_dir,
+                )
+                image_summary_path = args.image_summary_output or (
+                    artifact_dir / f"{source_path.stem}.image_summaries.json"
+                )
+                _save_json(image_summary_path, image_summary_artifact)
+                print(f"Saved image summaries: {image_summary_path}")
             story_plan = generate_story_plan(
                 args=args,
                 config=config,
@@ -1463,6 +1896,8 @@ def run_preprocessing(args: argparse.Namespace) -> tuple[Path, Path]:
                 model=model,
                 cache=cache,
                 artifact_dir=artifact_dir,
+                image_summaries=image_summaries,
+                spread_image_summaries=spread_image_summaries,
             )
             planner_path = args.planner_output or (
                 artifact_dir / f"{source_path.stem}.story_plan.json"
@@ -1478,6 +1913,8 @@ def run_preprocessing(args: argparse.Namespace) -> tuple[Path, Path]:
                         "source_pdf": str(pdf_path),
                         "model": f"{provider}:{model}",
                         "temperature": args.temperature,
+                        "image_summary_model": image_summary_artifact.get("model"),
+                        "image_summaries": str(image_summary_path),
                         "planner_output": str(planner_path),
                         "story_plan": story_plan,
                     },
@@ -1497,6 +1934,7 @@ def run_preprocessing(args: argparse.Namespace) -> tuple[Path, Path]:
             report_path=report_path,
             artifact_dir=artifact_dir,
             story_plan=story_plan,
+            image_summary_path=image_summary_path,
         )
         if args.render_pdf:
             pdf_output_path = args.pdf_output or output_path.with_suffix(".pdf")
@@ -1682,6 +2120,36 @@ def parse_args() -> argparse.Namespace:
             "neighboring spread on each side as context and are merged into a "
             f"complete plan. Default: {DEFAULT_STORY_PLANNER_SPREADS_PER_CALL}."
         ),
+    )
+    parser.add_argument(
+        "--image-summary-model",
+        default=DEFAULT_IMAGE_SUMMARY_MODEL,
+        help=(
+            "Provider-qualified vision model used to create locked "
+            f"visible_on_page evidence. Default: {DEFAULT_IMAGE_SUMMARY_MODEL}."
+        ),
+    )
+    parser.add_argument(
+        "--image-summary-temperature",
+        type=float,
+        default=DEFAULT_IMAGE_SUMMARY_TEMPERATURE,
+        help=(
+            "Sampling temperature for image summaries. Default: "
+            f"{DEFAULT_IMAGE_SUMMARY_TEMPERATURE}."
+        ),
+    )
+    parser.add_argument(
+        "--image-summaries",
+        type=Path,
+        help=(
+            "Load an existing versioned image_summaries JSON artifact instead "
+            "of calling the vision model."
+        ),
+    )
+    parser.add_argument(
+        "--image-summary-output",
+        type=Path,
+        help="Optional path for the reusable image_summaries JSON artifact.",
     )
     parser.add_argument(
         "--planner-output",

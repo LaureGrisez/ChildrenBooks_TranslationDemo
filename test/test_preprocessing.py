@@ -14,6 +14,8 @@ from src.translation.preprocessing import (
     adapted_pages_from_text,
     build_spread_sources,
     editorial_plan_prompt,
+    image_summary_prompt,
+    inject_image_summaries,
     parse_json_object,
     render_preprocessed_pdf,
     rewrite_prompt,
@@ -21,6 +23,8 @@ from src.translation.preprocessing import (
     story_planner_prompt,
     story_prompt,
     validate_story_plan,
+    validate_image_summaries,
+    validate_spread_summary,
     _previous_final_context,
     _save_page_image,
     _source_section,
@@ -232,6 +236,86 @@ class PreprocessingTests(unittest.TestCase):
         self.assertNotIn("visual_moment", prompt)
         self.assertNotIn("story_beat", prompt)
         self.assertNotIn("text_budget", prompt)
+
+    def test_image_summary_prompt_contains_character_context_and_page_contract(self) -> None:
+        spread = SpreadSource(
+            index=0,
+            pages=(
+                PageSource(page_number=6, source_text="Début."),
+                PageSource(page_number=7, source_text=""),
+            ),
+        )
+
+        prompt = image_summary_prompt(spread)
+
+        self.assertIn("Barbapapa is the father", prompt)
+        self.assertIn("Barbamama is the mother", prompt)
+        self.assertIn("Barbotine is orange, wears glasses", prompt)
+        self.assertIn("Barbalala is green", prompt)
+        self.assertIn("Lolita is their dog", prompt)
+        self.assertIn("main action or narrative beat across the entire spread", prompt)
+        self.assertIn("PAGE 6\nDébut.", prompt)
+        self.assertIn('"spread_summary"', prompt)
+        self.assertIn("1 to 3 concise sentences", prompt)
+        self.assertIn("physical pages 6, 7 separately", prompt)
+        self.assertIn('"page_number": 6', prompt)
+        self.assertIn('"page_number": 7', prompt)
+
+    def test_validates_image_summaries_and_locks_them_into_planner_prompt(self) -> None:
+        summaries = validate_image_summaries(
+            {
+                "schema_version": 1,
+                "pages": [
+                    {"page_number": 6, "visible_on_page": ["Barbidou regarde le lac."]},
+                    {"page_number": 7, "visible_on_page": ["Les enfants avancent."]},
+                ],
+            },
+            (6, 7),
+        )
+        spread = SpreadSource(
+            index=0,
+            pages=(
+                PageSource(page_number=6, source_text="Début."),
+                PageSource(page_number=7, source_text=""),
+            ),
+        )
+
+        prompt = story_planner_prompt(
+            source_text="Début.",
+            spreads=[spread],
+            image_summaries=summaries,
+            spread_image_summaries={0: "La famille cherche à traverser le lac."},
+        )
+
+        self.assertEqual(["Barbidou regarde le lac."], summaries[6])
+        self.assertIn("RÉSUMÉS VISUELS VERROUILLÉS", prompt)
+        self.assertIn("copie exactement la liste fournie", prompt)
+        self.assertIn("Barbidou regarde le lac.", prompt)
+        self.assertIn("La famille cherche à traverser le lac.", prompt)
+        self.assertEqual(
+            "La famille traverse.",
+            validate_spread_summary({"spread_summary": " La famille traverse. "}),
+        )
+
+        text_only_prompt = story_planner_prompt(
+            source_text="Début.",
+            spreads=[spread],
+            image_summaries=summaries,
+            raw_images_attached=False,
+        )
+        self.assertIn("Aucune image brute n'est jointe", text_only_prompt)
+
+        with self.assertRaisesRegex(ValueError, "one and three observations"):
+            validate_image_summaries(
+                {"pages": [{"page_number": 6, "visible_on_page": []}]}, (6,)
+            )
+
+        planner_payload = {"pages": [{"page_number": 6}]}
+        inject_image_summaries(planner_payload, summaries)
+        self.assertEqual(
+            ["Barbidou regarde le lac."],
+            planner_payload["pages"][0]["visible_on_page"],
+        )
 
     def test_story_planner_prompt_separates_target_and_context_pages(self) -> None:
         spreads = [

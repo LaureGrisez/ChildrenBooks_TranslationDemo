@@ -49,10 +49,17 @@ def judge_prompt(
     target_language: str,
     glossary: CharacterGlossary,
     blinded_options: dict[str, str],
+    visual_context: str = "",
+    image_attached: bool = False,
 ) -> str:
     """Build one blinded comparative paragraph-evaluation prompt."""
 
     score_shape = ",\n        ".join(f'"{criterion}": 0' for criterion in CRITERIA)
+    visual_block = (
+        f"\nLocked visual evidence for this paragraph:\n{visual_context}\n"
+        if visual_context
+        else ("\nA source-spread image is attached. Use it only for visual grounding.\n" if image_attached else "")
+    )
     return f"""
 You are an independent senior judge of children's-book translations.
 Compare only the current paragraph options. Identify concrete evidence before
@@ -70,6 +77,7 @@ Current source paragraph:
 
 Next source paragraph:
 {block["next_source"] or "(none)"}
+{visual_block}
 
 Blinded options:
 {json.dumps(blinded_options, ensure_ascii=False, indent=2)}
@@ -106,11 +114,18 @@ def synthesis_prompt(
     selected_options: dict[str, str],
     aggregate: dict[str, Any],
     previous_final: str,
+    visual_context: str = "",
+    image_attached: bool = False,
 ) -> str:
     """Build one sequential final-paragraph synthesis prompt."""
 
     anonymous_options, guidance = _anonymize_panel_guidance(
         selected_options, aggregate
+    )
+    visual_block = (
+        f"\nLocked visual evidence:\n{visual_context}\n"
+        if visual_context
+        else ("\nA source-spread image is attached for visual grounding.\n" if image_attached else "")
     )
     return f"""
 Create the final {target_language} translation of the current source paragraph.
@@ -137,6 +152,7 @@ Current source paragraph:
 
 Next source paragraph:
 {block["next_source"] or "(none)"}
+{visual_block}
 
 Selected candidate options:
 {json.dumps(anonymous_options, ensure_ascii=False, indent=2)}
@@ -147,10 +163,16 @@ Frozen panel guidance:
 
 
 def audit_prompt(
-    *, source_text: str, final_text: str, target_language: str, glossary: CharacterGlossary
+    *, source_text: str, final_text: str, target_language: str, glossary: CharacterGlossary,
+    visual_context: str = "", images_attached: bool = False,
 ) -> str:
     """Build a paragraph-scoped whole-book consistency audit prompt."""
 
+    visual_block = (
+        f"\nLocked visual evidence by page:\n{visual_context}\n"
+        if visual_context
+        else ("\nSource-spread images are attached for visual consistency checking.\n" if images_attached else "")
+    )
     return f"""
 Audit this complete {target_language} children's-book translation for consistency.
 Do not rewrite the book. Flag only paragraphs that require repair.
@@ -166,6 +188,7 @@ Source:
 
 Final translation:
 {final_text}
+{visual_block}
 
 Return valid JSON only:
 {{

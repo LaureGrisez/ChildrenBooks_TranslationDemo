@@ -38,6 +38,8 @@ from .prompts import (
 from .providers import ask_model_with_recovery
 from .reporting import ArtifactBundle, persist_run_artifacts
 from .segmentation import SpreadSegment, build_spread_segments, split_source_paragraphs
+from .structured_export import build_structured_book
+from .title import extract_source_title, title_translation_prompt
 
 
 load_dotenv()
@@ -360,7 +362,53 @@ def build_candidate_specs(
             )
             for spec in selected
         ]
+    if config.candidate_temperatures:
+        selected = [
+            CandidateSpec(
+                name=spec.name,
+                provider=spec.provider,
+                model=spec.model,
+                temperature=config.candidate_temperatures.get(spec.name, spec.temperature),
+                stance=spec.stance,
+            )
+            for spec in selected
+        ]
     return selected
+
+
+def load_image_summaries(path: Any) -> dict[int, list[str]]:
+    """Load the reusable preprocessing image-summary artifact."""
+
+    if path is None or not path.is_file():
+        raise FileNotFoundError(
+            "IMAGE_CONTEXT_MODE=summary requires an existing image-summary JSON "
+            f"artifact at '{path}'. Run the Version 1 preprocessing command first "
+            "(the command using --image-summary-output), then rerun translation. "
+            "The parent directory has been created automatically."
+        )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    pages = payload.get("pages", []) if isinstance(payload, dict) else []
+    summaries = {
+        int(page["page_number"]): [str(item) for item in page["visible_on_page"]]
+        for page in pages
+        if isinstance(page, dict)
+        and isinstance(page.get("page_number"), int)
+        and isinstance(page.get("visible_on_page"), list)
+    }
+    if not summaries:
+        raise ValueError(f"No valid page summaries found in {path}.")
+    return summaries
+
+
+def segment_visual_context(
+    segment: SpreadSegment, image_summaries: dict[int, list[str]]
+) -> str:
+    lines = []
+    for page_number in segment.page_numbers:
+        evidence = image_summaries.get(page_number, [])
+        if evidence:
+            lines.append(f"Page {page_number}: " + " ".join(evidence))
+    return "\n".join(lines)
 
 
 def candidate_judge_refs(candidate_specs: list[CandidateSpec]) -> list[str]:
@@ -550,6 +598,7 @@ def run_candidate(
     cache: ResponseCache,
     segments: list[SpreadSegment] | None = None,
     segment_images: dict[int, SegmentImageInput] | None = None,
+    image_summaries: dict[int, list[str]] | None = None,
 ) -> TranslationCandidate:
     """Run one candidate translation and capture outcome metadata."""
 
@@ -625,6 +674,11 @@ def run_candidate(
                                 if segment_images and segment.index in segment_images
                                 else None
                             ),
+                            profile=config.translation_profile,
+                            visual_context=(
+                                segment_visual_context(page_segment, image_summaries)
+                                if image_summaries else ""
+                            ),
                         )
                         label = (
                             f"{language} candidate {spec.name} segment "
@@ -657,12 +711,23 @@ def run_candidate(
                 target_language=language,
                 stance=spec.stance,
                 glossary=glossary,
+                profile=config.translation_profile,
+                visual_context=(
+                    "\n".join(
+                        f"Page {page}: " + " ".join(evidence)
+                        for page, evidence in sorted((image_summaries or {}).items())
+                    )
+                ),
             )
             translated = ask_model_with_recovery(
                 provider=spec.provider,
                 model=spec.model,
                 temperature=spec.temperature,
                 prompt=prompt,
+                image_data_urls=(
+                    [segment_images[index].data_url for index in sorted(segment_images)]
+                    if config.image_context_mode == "raw" and segment_images else None
+                ),
                 config=config,
                 cache=cache,
                 label=f"{language} candidate {spec.name}",
@@ -746,11 +811,15 @@ def build_application(config: TranslationWorkflowConfig | None = None):
     critic_provider, critic_model = runtime.critic_model_spec()
     aggregation_provider, aggregation_model = runtime.aggregation_model_spec()
     summarizer_provider, summarizer_model = runtime.critic_summarizer_model_spec()
+    title_provider, title_model = runtime.title_translation_model_spec()
     glossary = load_character_glossary(
         runtime.character_names_csv, source_language=runtime.source_language
     )
     target_languages = _resolve_target_languages(runtime, glossary)
     source_text = runtime.load_source_text()
+    source_title = extract_source_title(
+        runtime.source_pdf_path, runtime.title_page_number, runtime.source_title
+    )
     candidate_specs = build_candidate_specs(runtime)
     if runtime.is_panel_mode() and not runtime.panel_judges:
         runtime.panel_judges = candidate_judge_refs(candidate_specs)
@@ -760,7 +829,13 @@ def build_application(config: TranslationWorkflowConfig | None = None):
     text_page_numbers = []
     segments: list[SpreadSegment] | None = None
     segment_images: dict[int, SegmentImageInput] | None = None
-    if runtime.is_multimodal_mode():
+    image_summaries: dict[int, list[str]] | None = None
+    needs_page_alignment = (
+        runtime.is_multimodal_mode()
+        or runtime.image_context_mode != "none"
+        or bool(runtime.evaluation_image_stages)
+    )
+    if needs_page_alignment:
         # Multimodal candidate generation needs a stable mapping from cleaned
         # source paragraphs to text-bearing PDF pages and their spread images.
         # Text mode leaves segments and images as None.
@@ -780,6 +855,26 @@ def build_application(config: TranslationWorkflowConfig | None = None):
             text_page_numbers=text_page_numbers,
             context_window=runtime.source_context_window,
         )
+    if runtime.image_context_mode == "summary":
+        if (
+            runtime.image_summaries_path is not None
+            and not runtime.image_summaries_path.is_file()
+            and runtime.auto_generate_image_summaries
+        ):
+            from .preprocessing import ensure_workflow_image_summaries
+
+            live_log(
+                "Image-summary artifact is missing; generating it automatically."
+            )
+            ensure_workflow_image_summaries(
+                runtime, runtime.image_summaries_path
+            )
+        image_summaries = load_image_summaries(runtime.image_summaries_path)
+    if segments and (
+        runtime.is_multimodal_mode()
+        or runtime.image_context_mode == "raw"
+        or bool(runtime.evaluation_image_stages)
+    ):
         rendered_spreads = render_spread_images(runtime, segments)
         segment_images = {
             spread.segment_index: SegmentImageInput(
@@ -788,11 +883,77 @@ def build_application(config: TranslationWorkflowConfig | None = None):
             )
             for spread in rendered_spreads
         }
+    paragraph_visual_context: dict[int, str] = {}
+    paragraph_image_urls: dict[int, str] = {}
+    if segments:
+        paragraph_index = 0
+        for segment in segments:
+            for page_number in segment.page_numbers:
+                if image_summaries:
+                    evidence = image_summaries.get(page_number, [])
+                    paragraph_visual_context[paragraph_index] = (
+                        f"Page {page_number}: " + " ".join(evidence) if evidence else ""
+                    )
+                if segment_images and segment.index in segment_images:
+                    paragraph_image_urls[paragraph_index] = segment_images[segment.index].data_url
+                paragraph_index += 1
     cache = ResponseCache(runtime.translation_cache_dir)
     tracker = LocalTrackingClient(
         project=runtime.project_name,
         storage_dir=runtime.burr_storage_dir,
     )
+
+    def structured_books(
+        finals: dict[str, str], translated_titles: dict[str, str]
+    ) -> dict[str, dict[str, Any]]:
+        if runtime.source_pdf_path is None:
+            return {}
+        return {
+            language: build_structured_book(
+                source_text=source_text,
+                translated_text=final_text,
+                source_title=source_title,
+                translated_title=translated_titles.get(language, ""),
+                language=language,
+                glossary=glossary,
+                config=runtime,
+            )
+            for language, final_text in finals.items()
+        }
+
+    @action(
+        reads=["target_languages", "decision_log"],
+        writes=["source_title", "translated_titles", "decision_log"],
+    )
+    def translate_titles(state: State) -> State:
+        """Translate the publication title independently from body synthesis."""
+
+        translations = {}
+        updated = state
+        for language in state["target_languages"]:
+            if not source_title:
+                translations[language] = ""
+                continue
+            translated = ask_model_with_recovery(
+                provider=title_provider,
+                model=title_model,
+                temperature=runtime.title_translation_temperature,
+                prompt=title_translation_prompt(
+                    source_title=source_title,
+                    source_language=runtime.source_language,
+                    target_language=language,
+                    glossary=glossary,
+                ),
+                config=runtime,
+                cache=cache,
+                label=f"{language} title translation",
+            )
+            translations[language] = normalize_single_paragraph(translated)
+            updated = log_event(
+                updated, "translate_titles", f"Translated title for {language}.",
+                source_title=source_title, translated_title=translations[language],
+            )
+        return updated.update(source_title=source_title, translated_titles=translations)
 
     # Shared first action for every mode combination.
     @action(
@@ -849,6 +1010,7 @@ def build_application(config: TranslationWorkflowConfig | None = None):
                         cache,
                         segments,
                         segment_images,
+                        image_summaries,
                     )
                     for spec in candidate_specs
                 ]
@@ -969,6 +1131,11 @@ def build_application(config: TranslationWorkflowConfig | None = None):
                             target_language=language,
                             glossary=glossary,
                             blinded_options=blinded,
+                            visual_context=paragraph_visual_context.get(block["index"], ""),
+                            image_attached=(
+                                "judges" in runtime.evaluation_image_stages
+                                and block["index"] in paragraph_image_urls
+                            ),
                         )
                         paragraph_requests[judge.judge_id] = {
                             "provider": judge.provider,
@@ -981,6 +1148,11 @@ def build_application(config: TranslationWorkflowConfig | None = None):
                             model=judge.model,
                             temperature=runtime.panel_judge_temperature,
                             prompt=prompt,
+                            image_data_url=(
+                                paragraph_image_urls.get(block["index"])
+                                if "judges" in runtime.evaluation_image_stages
+                                else None
+                            ),
                             config=runtime,
                             cache=cache,
                             label=f"{language} {paragraph_id} {judge.judge_id}",
@@ -1018,6 +1190,11 @@ def build_application(config: TranslationWorkflowConfig | None = None):
                                         model=judge.model,
                                         temperature=0.0,
                                         prompt=correction_prompt,
+                                        image_data_url=(
+                                            paragraph_image_urls.get(block["index"])
+                                            if "judges" in runtime.evaluation_image_stages
+                                            else None
+                                        ),
                                         config=runtime,
                                         cache=cache,
                                         label=(
@@ -1166,6 +1343,15 @@ def build_application(config: TranslationWorkflowConfig | None = None):
                         selected_options=selected,
                         aggregate=aggregate,
                         previous_final=previous_final,
+                        visual_context=paragraph_visual_context.get(block["index"], ""),
+                        image_attached=(
+                            "synthesis" in runtime.evaluation_image_stages
+                            and block["index"] in paragraph_image_urls
+                        ),
+                    ),
+                    image_data_url=(
+                        paragraph_image_urls.get(block["index"])
+                        if "synthesis" in runtime.evaluation_image_stages else None
                     ),
                     config=runtime,
                     cache=cache,
@@ -1217,6 +1403,14 @@ def build_application(config: TranslationWorkflowConfig | None = None):
                     final_text=final_text,
                     target_language=language,
                     glossary=glossary,
+                    visual_context="\n".join(
+                        value for _, value in sorted(paragraph_visual_context.items()) if value
+                    ),
+                    images_attached="audit" in runtime.evaluation_image_stages,
+                ),
+                image_data_urls=(
+                    [segment_images[index].data_url for index in sorted(segment_images)]
+                    if "audit" in runtime.evaluation_image_stages and segment_images else None
                 ),
                 config=runtime,
                 cache=cache,
@@ -1241,8 +1435,8 @@ def build_application(config: TranslationWorkflowConfig | None = None):
         return updated.update(book_audits=audits)
 
     @action(
-        reads=["aligned_candidates", "final_paragraphs", "book_audits", "decision_log"],
-        writes=["repair_results", "final_translations", "decision_log"],
+        reads=["aligned_candidates", "final_paragraphs", "book_audits", "translated_titles", "decision_log"],
+        writes=["repair_results", "final_translations", "structured_translations", "decision_log"],
     )
     def repair_flagged_paragraphs(state: State) -> State:
         """Repair only audit-flagged paragraphs and assemble the panel final.
@@ -1309,7 +1503,11 @@ def build_application(config: TranslationWorkflowConfig | None = None):
                 f"Final panel translation assembled for {language}.",
                 repaired_paragraphs=len(language_repairs),
             )
-        next_state = updated.update(repair_results=repairs, final_translations=finals)
+        next_state = updated.update(
+            repair_results=repairs,
+            final_translations=finals,
+            structured_translations=structured_books(finals, state["translated_titles"]),
+        )
         persist_partial_artifacts(next_state, runtime)
         return next_state
 
@@ -1435,8 +1633,8 @@ def build_application(config: TranslationWorkflowConfig | None = None):
         return next_state
 
     @action(
-        reads=["text", "candidate_translations", "critic_summaries", "decision_log"],
-        writes=["final_translations", "decision_log"],
+        reads=["text", "candidate_translations", "critic_summaries", "translated_titles", "decision_log"],
+        writes=["final_translations", "structured_translations", "decision_log"],
     )
     def generate_final_text(state: State) -> State:
         """Generate the final translation for the single-critic branch.
@@ -1541,7 +1739,10 @@ def build_application(config: TranslationWorkflowConfig | None = None):
                 f"{preview_text(finals[language], 120)}"
             )
 
-        next_state = updated.update(final_translations=finals)
+        next_state = updated.update(
+            final_translations=finals,
+            structured_translations=structured_books(finals, state["translated_titles"]),
+        )
         persist_partial_artifacts(next_state, runtime)
         return next_state
 
@@ -1570,6 +1771,7 @@ def build_application(config: TranslationWorkflowConfig | None = None):
         # Panel evaluation replaces the single critic/summary/final actions.
         # Candidate generation remains shared and can itself be text or multimodal.
         builder = builder.with_actions(
+            translate_titles,
             generate_candidates,
             align_candidate_paragraphs,
             run_panel_judges,
@@ -1578,6 +1780,7 @@ def build_application(config: TranslationWorkflowConfig | None = None):
             audit_book_consistency,
             repair_flagged_paragraphs,
         ).with_transitions(
+            ("translate_titles", "generate_candidates"),
             ("generate_candidates", "align_candidate_paragraphs"),
             ("align_candidate_paragraphs", "run_panel_judges"),
             ("run_panel_judges", "aggregate_panel_judgments"),
@@ -1589,17 +1792,19 @@ def build_application(config: TranslationWorkflowConfig | None = None):
         # Single evaluation preserves the original critic -> summary -> final
         # sequence after either text or multimodal candidate generation.
         builder = builder.with_actions(
+            translate_titles,
             generate_candidates,
             critique_candidates,
             summarize_critic,
             generate_final_text,
         ).with_transitions(
+            ("translate_titles", "generate_candidates"),
             ("generate_candidates", "critique_candidates"),
             ("critique_candidates", "summarize_critic"),
             ("summarize_critic", "generate_final_text"),
         )
     app = (
-        builder.with_entrypoint("generate_candidates")
+        builder.with_entrypoint("translate_titles")
         .with_tracker(tracker)
         .build()
     )
@@ -1721,6 +1926,10 @@ def print_results(
         for language, output_path in saved_paths.versioned_final_paths.items():
             console.print(
                 f"[dim]{language} run artifact saved to {output_path}.[/dim]"
+            )
+        for language, output_path in saved_paths.latest_json_paths.items():
+            console.print(
+                f"[dim]{language} structured JSON saved to {output_path}.[/dim]"
             )
         for language, report_path in saved_paths.report_paths.items():
             console.print(

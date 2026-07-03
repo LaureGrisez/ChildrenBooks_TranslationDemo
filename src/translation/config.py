@@ -38,10 +38,22 @@ def _split_csv_env(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _parse_temperature_map(value: str) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for item in _split_csv_env(value):
+        name, separator, temperature = item.partition(":")
+        if not separator or not name.strip():
+            raise ValueError(
+                "CANDIDATE_TEMPERATURES entries must use candidate:temperature."
+            )
+        result[name.strip()] = float(temperature)
+    return result
+
+
 def _build_run_id() -> str:
     """Create a readable per-run identifier for artifact storage."""
 
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
 
 def _slugify(value: str) -> str:
@@ -70,9 +82,23 @@ class TranslationWorkflowConfig:
             else DEFAULT_SOURCE_PDF_PATH
         )
     )
+    require_original_source: bool = field(
+        default_factory=lambda: os.getenv("REQUIRE_ORIGINAL_SOURCE", "0").strip() != "0"
+    )
     character_names_csv: Path = DEFAULT_CHARACTER_NAMES_CSV
-    translation_output_dir: Path = DEFAULT_TRANSLATION_OUTPUT_DIR
-    translation_cache_dir: Path = DEFAULT_TRANSLATION_CACHE_DIR
+    translation_output_dir: Path = field(
+        default_factory=lambda: Path(
+            os.getenv("TRANSLATION_OUTPUT_DIR", str(DEFAULT_TRANSLATION_OUTPUT_DIR))
+        )
+    )
+    translation_cache_dir: Path = field(
+        default_factory=lambda: Path(
+            os.getenv("TRANSLATION_CACHE_DIR", str(DEFAULT_TRANSLATION_CACHE_DIR))
+        )
+    )
+    experiment_name: str = field(
+        default_factory=lambda: _slugify(os.getenv("EXPERIMENT_NAME", "default"))
+    )
     workflow_mode: str = field(
         default_factory=lambda: os.getenv("WORKFLOW_MODE", "text").strip().lower()
     )
@@ -130,6 +156,31 @@ class TranslationWorkflowConfig:
             else None
         )
     )
+    candidate_temperatures: dict[str, float] = field(default_factory=dict)
+    translation_profile: str = field(
+        default_factory=lambda: os.getenv("TRANSLATION_PROFILE", "normal").strip().lower()
+    )
+    image_context_mode: str = field(
+        default_factory=lambda: os.getenv("IMAGE_CONTEXT_MODE", "none").strip().lower()
+    )
+    image_summaries_path: Path | None = field(
+        default_factory=lambda: (
+            Path(os.environ["IMAGE_SUMMARIES_PATH"])
+            if os.getenv("IMAGE_SUMMARIES_PATH", "").strip()
+            else None
+        )
+    )
+    image_summary_model: str = field(
+        default_factory=lambda: os.getenv("IMAGE_SUMMARY_MODEL", "openai:gpt-4o").strip()
+    )
+    image_summary_temperature: float = field(
+        default_factory=lambda: float(os.getenv("IMAGE_SUMMARY_TEMPERATURE", "0.2"))
+    )
+    auto_generate_image_summaries: bool = field(
+        default_factory=lambda: os.getenv("AUTO_GENERATE_IMAGE_SUMMARIES", "1").strip() != "0"
+    )
+    evaluation_image_stages: set[str] = field(default_factory=set)
+    model_call_metrics: list[dict[str, object]] = field(default_factory=list)
     openai_base_model: str = field(
         default_factory=lambda: os.getenv("OPENAI_BASE_MODEL", "gpt-4o")
     )
@@ -169,6 +220,18 @@ class TranslationWorkflowConfig:
                 ),
             ),
         ).strip()
+    )
+    source_title: str = field(
+        default_factory=lambda: os.getenv("SOURCE_TITLE", "").strip()
+    )
+    title_page_number: int = field(
+        default_factory=lambda: max(1, int(os.getenv("TITLE_PAGE_NUMBER", "5")))
+    )
+    title_translation_model: str = field(
+        default_factory=lambda: os.getenv("TITLE_TRANSLATION_MODEL", "").strip()
+    )
+    title_translation_temperature: float = field(
+        default_factory=lambda: float(os.getenv("TITLE_TRANSLATION_TEMPERATURE", "0.1"))
     )
     panel_judges: list[str] = field(default_factory=list)
     panel_judge_temperature: float = field(
@@ -246,6 +309,12 @@ class TranslationWorkflowConfig:
         raw_candidate_names = os.getenv("CANDIDATE_NAMES", "").strip()
         if raw_candidate_names:
             config.candidate_names = _split_csv_env(raw_candidate_names)
+        config.candidate_temperatures = _parse_temperature_map(
+            os.getenv("CANDIDATE_TEMPERATURES", "")
+        )
+        config.evaluation_image_stages = set(
+            _split_csv_env(os.getenv("EVALUATION_IMAGE_STAGES", ""))
+        )
         raw_panel_judges = os.getenv("PANEL_JUDGES", "").strip()
         if raw_panel_judges:
             config.panel_judges = _split_csv_env(raw_panel_judges)
@@ -254,15 +323,35 @@ class TranslationWorkflowConfig:
         return config
 
     def apply_environment_defaults(self) -> None:
-        """Expose repository-local credentials when no explicit override exists."""
+        """Expose credentials and create configured runtime output directories."""
 
         if DEFAULT_GOOGLE_CREDENTIALS.exists():
             os.environ.setdefault(
                 "GOOGLE_APPLICATION_CREDENTIALS", str(DEFAULT_GOOGLE_CREDENTIALS)
             )
+        self.translation_output_dir.mkdir(parents=True, exist_ok=True)
+        self.experiment_output_dir().mkdir(parents=True, exist_ok=True)
+        self.translation_cache_dir.mkdir(parents=True, exist_ok=True)
+        Path(self.burr_storage_dir).expanduser().mkdir(parents=True, exist_ok=True)
+        if self.image_summaries_path is not None:
+            self.image_summaries_path.parent.mkdir(parents=True, exist_ok=True)
 
     def validate(self) -> None:
         """Reject invalid workflow combinations before model calls begin."""
+
+        if self.require_original_source:
+            source_paths = [self.source_text_path]
+            if self.source_pdf_path is not None:
+                source_paths.append(self.source_pdf_path)
+            preprocessed = [
+                str(path) for path in source_paths
+                if any(marker in path.name.lower() for marker in (".single_page", "_single_page", ".single-page"))
+            ]
+            if preprocessed:
+                raise ValueError(
+                    "REQUIRE_ORIGINAL_SOURCE=1 rejects preprocessed source files: "
+                    + ", ".join(preprocessed)
+                )
 
         if self.workflow_mode not in {"text", "multimodal"}:
             raise ValueError("WORKFLOW_MODE must be either 'text' or 'multimodal'.")
@@ -271,6 +360,18 @@ class TranslationWorkflowConfig:
                 "EVALUATION_MODE must be 'single' or 'panel'. "
                 "adaptive_panel is not implemented yet."
             )
+        if self.translation_profile not in {"normal", "creative"}:
+            raise ValueError("TRANSLATION_PROFILE must be 'normal' or 'creative'.")
+        if self.image_context_mode not in {"none", "summary", "raw"}:
+            raise ValueError("IMAGE_CONTEXT_MODE must be 'none', 'summary', or 'raw'.")
+        invalid_stages = self.evaluation_image_stages - {"judges", "synthesis", "audit"}
+        if invalid_stages:
+            raise ValueError(
+                "EVALUATION_IMAGE_STAGES supports judges,synthesis,audit; invalid: "
+                + ", ".join(sorted(invalid_stages))
+            )
+        if self.image_context_mode == "summary" and self.image_summaries_path is None:
+            raise ValueError("IMAGE_SUMMARIES_PATH is required for IMAGE_CONTEXT_MODE=summary.")
         weights = (
             self.panel_pairwise_weight,
             self.panel_ranking_weight,
@@ -296,6 +397,8 @@ class TranslationWorkflowConfig:
             ("DEFAULT_CRITIC_MODEL", self.default_critic_model),
             ("DEFAULT_AGGREGATION_MODEL", self.default_aggregation_model),
             ("DEFAULT_CRITIC_SUMMARIZER_MODEL", self.default_critic_summarizer_model),
+            ("TITLE_TRANSLATION_MODEL", self.title_translation_model_ref()),
+            ("IMAGE_SUMMARY_MODEL", self.image_summary_model),
         ):
             try:
                 self.parse_model_ref(model_ref)
@@ -310,8 +413,19 @@ class TranslationWorkflowConfig:
                 raise ValueError("Panel judge models must be unique.")
         if self.candidate_temperature is not None and not 0 <= self.candidate_temperature <= 2:
             raise ValueError("CANDIDATE_TEMPERATURE must be between 0 and 2.")
+        invalid_temperatures = {
+            name: value
+            for name, value in self.candidate_temperatures.items()
+            if not 0 <= value <= 2
+        }
+        if invalid_temperatures:
+            raise ValueError("CANDIDATE_TEMPERATURES values must be between 0 and 2.")
         if not 0 <= self.panel_judge_temperature <= 2:
             raise ValueError("PANEL_JUDGE_TEMPERATURE must be between 0 and 2.")
+        if not 0 <= self.title_translation_temperature <= 2:
+            raise ValueError("TITLE_TRANSLATION_TEMPERATURE must be between 0 and 2.")
+        if not 0 <= self.image_summary_temperature <= 2:
+            raise ValueError("IMAGE_SUMMARY_TEMPERATURE must be between 0 and 2.")
 
     def load_source_text(self) -> str:
         """Load the French source text from disk."""
@@ -363,6 +477,14 @@ class TranslationWorkflowConfig:
 
         return self.parse_model_ref(self.default_critic_summarizer_model)
 
+    def title_translation_model_ref(self) -> str:
+        """Return the explicit title model or fall back to final aggregation."""
+
+        return self.title_translation_model or self.default_aggregation_model
+
+    def title_translation_model_spec(self) -> tuple[str, str]:
+        return self.parse_model_ref(self.title_translation_model_ref())
+
     def book_name(self) -> str:
         """Return a stable book slug derived from the source filename."""
 
@@ -374,14 +496,19 @@ class TranslationWorkflowConfig:
         """Return the stable top-level output path for one language."""
 
         language_indicator = self.language_code(language)
-        return self.translation_output_dir / (
+        return self.experiment_output_dir() / (
             f"{self.book_name()}_{language_indicator}.txt"
         )
+
+    def experiment_output_dir(self) -> Path:
+        """Return the isolated artifact root for one named experiment."""
+
+        return self.translation_output_dir / self.experiment_name
 
     def language_run_dir(self, language: str) -> Path:
         """Return the per-language, per-run artifact directory."""
 
-        return self.translation_output_dir / self.language_code(language) / self.run_id
+        return self.experiment_output_dir() / self.language_code(language) / self.run_id
 
     def versioned_translation_path(self, language: str) -> Path:
         """Return the per-run final translation path."""
@@ -390,6 +517,12 @@ class TranslationWorkflowConfig:
         return self.language_run_dir(language) / (
             f"{self.book_name()}_{model_slug}.txt"
         )
+
+    def latest_structured_translation_path(self, language: str) -> Path:
+        return self.latest_translation_path(language).with_suffix(".json")
+
+    def versioned_structured_translation_path(self, language: str) -> Path:
+        return self.versioned_translation_path(language).with_suffix(".json")
 
     def candidate_output_path(
         self, language: str, candidate_name: str, candidate_model: str
@@ -419,7 +552,7 @@ class TranslationWorkflowConfig:
     def multimodal_debug_dir(self) -> Path:
         """Return the per-run debug directory for rendered spread images."""
 
-        return self.translation_output_dir / "_multimodal_debug" / self.run_id
+        return self.experiment_output_dir() / "_multimodal_debug" / self.run_id
 
     def panel_artifact_dir(self, language: str) -> Path:
         """Return the panel artifact directory for one language."""

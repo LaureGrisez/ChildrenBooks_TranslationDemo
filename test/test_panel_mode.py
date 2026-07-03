@@ -263,6 +263,52 @@ class ContractAndConfigTests(unittest.TestCase):
         specs = build_candidate_specs(config)
         self.assertEqual([0.7, 0.7, 0.7], [spec.temperature for spec in specs])
 
+    def test_per_candidate_temperatures_override_selected_specs(self) -> None:
+        from src.translation.workflow import build_candidate_specs
+
+        config = TranslationWorkflowConfig(
+            candidate_names=["gpt5_5", "claude_sonnet_4_6", "gemini_3"],
+            candidate_temperatures={"gpt5_5": 1.1, "gemini_3": 0.8},
+        )
+        specs = build_candidate_specs(config)
+        self.assertEqual([1.1, 0.4, 0.8], [spec.temperature for spec in specs])
+
+    def test_validates_experiment_profile_and_image_parameters(self) -> None:
+        TranslationWorkflowConfig(
+            translation_profile="creative",
+            image_context_mode="summary",
+            image_summaries_path=Path("summaries.json"),
+            evaluation_image_stages={"judges", "synthesis", "audit"},
+        ).validate()
+        with self.assertRaisesRegex(ValueError, "IMAGE_SUMMARIES_PATH"):
+            TranslationWorkflowConfig(image_context_mode="summary").validate()
+        with self.assertRaisesRegex(ValueError, "TRANSLATION_PROFILE"):
+            TranslationWorkflowConfig(translation_profile="wild").validate()
+
+    def test_runtime_directories_are_created_recursively(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TranslationWorkflowConfig(
+                translation_output_dir=root / "client" / "outputs",
+                translation_cache_dir=root / "client" / "cache",
+                burr_storage_dir=str(root / "client" / "burr"),
+                image_summaries_path=root / "client" / "preprocessing" / "summary.json",
+            )
+            config.apply_environment_defaults()
+            self.assertTrue(config.translation_output_dir.is_dir())
+            self.assertTrue(config.translation_cache_dir.is_dir())
+            self.assertTrue(Path(config.burr_storage_dir).is_dir())
+            self.assertTrue(config.image_summaries_path.parent.is_dir())
+
+    def test_original_source_guard_rejects_preprocessed_inputs(self) -> None:
+        config = TranslationWorkflowConfig(
+            source_text_path=Path("book.single_page.txt"),
+            source_pdf_path=Path("book.single_page.pdf"),
+            require_original_source=True,
+        )
+        with self.assertRaisesRegex(ValueError, "rejects preprocessed source"):
+            config.validate()
+
     def test_all_five_builtin_candidates_can_be_selected(self) -> None:
         from src.translation.workflow import build_candidate_specs, candidate_judge_refs
 
@@ -871,7 +917,7 @@ class PanelWorkflowTests(unittest.TestCase):
     def test_fake_provider_single_workflow_is_preserved(self) -> None:
         from src.translation.workflow import TranslationCandidate, build_application
 
-        def fake_candidate(spec, text, source_language, language, glossary, config, cache, segments, segment_images):
+        def fake_candidate(spec, text, source_language, language, glossary, config, cache, segments, segment_images, image_summaries):
             return TranslationCandidate(
                 language=language,
                 name=spec.name,
@@ -936,7 +982,7 @@ class PanelWorkflowTests(unittest.TestCase):
             build_application,
         )
 
-        def fake_candidate(spec, text, source_language, language, glossary, config, cache, segments, segment_images):
+        def fake_candidate(spec, text, source_language, language, glossary, config, cache, segments, segment_images, image_summaries):
             return TranslationCandidate(
                 language=language,
                 name=spec.name,

@@ -34,8 +34,18 @@ def translation_prompt(
     target_language: str,
     stance: str,
     glossary: CharacterGlossary,
+    profile: str = "normal",
+    visual_context: str = "",
 ) -> str:
     """Prompt for one translation candidate."""
+    creative_guidance = (
+        "- You may reshape syntax and idioms for livelier storytelling, while preserving "
+        "every fact, action, character, and narrative intention.\n"
+        "- Prefer vivid, playful, memorable read-aloud phrasing over literal structure."
+        if profile == "creative"
+        else "- Prefer faithful, polished phrasing; alter the source only when natural target-language usage requires it."
+    )
+    visual_block = f"\nLocked visual context (do not invent beyond it):\n{visual_context}\n" if visual_context else ""
     return f"""
 You are translating a Barbapapa children's book from {source_language} into {target_language}.
 
@@ -52,6 +62,7 @@ Language guidance:
 - Use natural modern {target_language}
 - Avoid overly formal wording
 - Keep repetitions and rhythms that work well in read-aloud storytelling
+{creative_guidance}
 
 Translator stance:
 - {stance}
@@ -61,6 +72,7 @@ Character and side-character names:
 
 Source text in {source_language}:
 {text}
+{visual_block}
 """
 
 
@@ -133,6 +145,8 @@ def segmented_translation_prompt(
     total_segments: int,
     previous_translated_segments: list[str] | None = None,
     spread_pages: tuple[int, ...] | None = None,
+    profile: str = "normal",
+    visual_context: str = "",
 ) -> str:
     """Prompt for one spread-aligned translation segment."""
 
@@ -145,6 +159,13 @@ def segmented_translation_prompt(
     previous_source_context = segment.previous_source_text.strip()
     previous_translated_context = "\n\n".join(previous_translated_segments or []).strip()
 
+    creative_guidance = (
+        "- You may reshape syntax and idioms for livelier storytelling, while preserving every visible and stated action.\n"
+        "- Prefer vivid, playful, memorable read-aloud phrasing."
+        if profile == "creative"
+        else "- Prefer faithful, polished phrasing and conservative adaptation."
+    )
+    visual_block = f"\nLocked visual context:\n{visual_context}\n" if visual_context else ""
     return f"""
 You are translating one double-page spread segment of a Barbapapa children's book from {source_language} into {target_language}.{spread_label}
 
@@ -162,6 +183,7 @@ Language guidance:
 - Use natural modern {target_language}
 - Avoid overly formal wording
 - Keep repetitions and rhythms that work well in read-aloud storytelling
+{creative_guidance}
 
 Translator stance:
 - {stance}
@@ -179,6 +201,7 @@ Book context:
 
 Current source pages in {source_language}:
 {segment.source_text}
+{visual_block}
 
 Return only the translation of the current source pages in {target_language}.
 If the current spread contains text from two body pages, keep the two translated page blocks in order and separate them with one blank line.

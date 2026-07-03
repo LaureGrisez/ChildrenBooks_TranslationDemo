@@ -63,7 +63,8 @@ def _ask_provider(
     prompt: str,
     image_data_url: str | None = None,
     image_data_urls: list[str] | None = None,
-) -> str:
+    return_metrics: bool = False,
+) -> str | tuple[str, dict[str, Any]]:
     """Call any configured provider through LiteLLM's unified interface."""
 
     images = image_data_urls or ([image_data_url] if image_data_url else [])
@@ -81,7 +82,21 @@ def _ask_provider(
         request["temperature"] = temperature
 
     response = litellm.completion(**request)
-    return response.choices[0].message.content or ""
+    usage = getattr(response, "usage", None)
+    if hasattr(usage, "model_dump"):
+        usage = usage.model_dump()
+    elif usage is not None and not isinstance(usage, dict):
+        usage = dict(usage)
+    try:
+        estimated_cost = float(litellm.completion_cost(completion_response=response))
+    except Exception:
+        estimated_cost = None
+    text = response.choices[0].message.content or ""
+    metrics = {
+        "usage": usage or {},
+        "estimated_cost_usd": estimated_cost,
+    }
+    return (text, metrics) if return_metrics else text
 
 
 def ask_model_with_recovery(
@@ -120,6 +135,11 @@ def ask_model_with_recovery(
             prompt=cache_prompt,
         )
         if cached is not None:
+            config.model_call_metrics.append({
+                "label": label, "provider": provider, "model": model,
+                "temperature": temperature, "cache_hit": True,
+                "latency_seconds": 0.0, "usage": {}, "estimated_cost_usd": 0.0,
+            })
             return cached
 
     retryable = (
@@ -134,14 +154,26 @@ def ask_model_with_recovery(
     last_error: Exception | None = None
     for attempt in range(1, config.openai_retry_attempts + 1):
         try:
-            response = _ask_provider(
+            started = time.monotonic()
+            result = _ask_provider(
                 provider,
                 model,
                 temperature,
                 prompt,
                 image_data_url=image_data_url,
                 image_data_urls=image_data_urls,
+                return_metrics=True,
             )
+            if isinstance(result, tuple):
+                response, metrics = result
+            else:  # Compatibility with patched/custom adapters returning plain text.
+                response, metrics = result, {"usage": {}, "estimated_cost_usd": None}
+            config.model_call_metrics.append({
+                "label": label, "provider": provider, "model": model,
+                "temperature": temperature, "cache_hit": False,
+                "latency_seconds": round(time.monotonic() - started, 3),
+                **metrics,
+            })
             if config.enable_cache:
                 cache.set(
                     provider=provider,

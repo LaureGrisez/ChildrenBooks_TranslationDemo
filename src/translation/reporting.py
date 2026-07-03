@@ -24,6 +24,8 @@ class ArtifactBundle:
 
     latest_final_paths: dict[str, Path] = field(default_factory=dict)
     versioned_final_paths: dict[str, Path] = field(default_factory=dict)
+    latest_json_paths: dict[str, Path] = field(default_factory=dict)
+    versioned_json_paths: dict[str, Path] = field(default_factory=dict)
     candidate_paths: dict[str, dict[str, Path]] = field(default_factory=dict)
     report_paths: dict[str, Path] = field(default_factory=dict)
 
@@ -38,11 +40,18 @@ def persist_run_artifacts(
 
     candidate_translations = state.get("candidate_translations", {})
     final_translations = state.get("final_translations", {})
+    structured_translations = state.get("structured_translations", {})
     critic_reviews = state.get("critic_reviews", {})
     critic_reasoning = state.get("critic_reasoning", {})
     critic_winners = state.get("critic_winners", {})
 
     for language, candidates in candidate_translations.items():
+        metrics_path = config.language_run_dir(language) / "model_call_metrics.json"
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_path.write_text(
+            json.dumps(config.model_call_metrics, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         language_candidates = {}
         for candidate in candidates:
             candidate_path = config.candidate_output_path(
@@ -66,6 +75,16 @@ def persist_run_artifacts(
         versioned_path.write_text(normalized_final, encoding="utf-8")
         bundle.latest_final_paths[language] = latest_path
         bundle.versioned_final_paths[language] = versioned_path
+
+        structured = structured_translations.get(language)
+        if structured is not None:
+            latest_json_path = config.latest_structured_translation_path(language)
+            versioned_json_path = config.versioned_structured_translation_path(language)
+            serialized = json.dumps(structured, ensure_ascii=False, indent=2) + "\n"
+            latest_json_path.write_text(serialized, encoding="utf-8")
+            versioned_json_path.write_text(serialized, encoding="utf-8")
+            bundle.latest_json_paths[language] = latest_json_path
+            bundle.versioned_json_paths[language] = versioned_json_path
 
         report_path = config.report_output_path(language)
         report_path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,6 +1,7 @@
 .env
 .venv/
 .crewai/
+.DS_Store
 Library/
 __pycache__/
 *.pyc
@@ -13,6 +14,8 @@ __pycache__/
 *.tar.gz
 credentials/
 /translation/
+/client_presentation/
+/docs/
 .burr/
 .translation_cache/
 !requirements-ui.txt

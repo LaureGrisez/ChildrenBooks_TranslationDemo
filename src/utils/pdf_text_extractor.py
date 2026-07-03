@@ -33,6 +33,25 @@ LIGATURES = {
     "ﬆ": "st",
 }
 
+PRODUCTION_METADATA_RE = re.compile(
+    r".*(?:_Layout\s+\d+|XP-[A-Z0-9_-]+).*\bPage\s*\d+\s*$",
+    flags=re.IGNORECASE,
+)
+
+
+def is_production_metadata_line(text: str) -> bool:
+    """Identify print-production footer/header lines, not story content."""
+
+    return bool(PRODUCTION_METADATA_RE.fullmatch(" ".join(text.split())))
+
+
+def remove_production_metadata(text: str) -> str:
+    """Drop layout filename/date/page markers emitted by publishing software."""
+
+    return "\n".join(
+        line for line in text.splitlines() if not is_production_metadata_line(line)
+    )
+
 
 def extract_pdf_text(
     pdf_path: Path,
@@ -90,6 +109,7 @@ def normalize_whitespace(text: str) -> str:
 def deterministic_repair(text: str) -> str:
     """Apply safe, rule-based repairs for French PDF-extracted text."""
 
+    text = remove_production_metadata(text)
     text = normalize_ligatures(text)
     text = mend_ligature_word_splits(text)
     return normalize_whitespace(text)

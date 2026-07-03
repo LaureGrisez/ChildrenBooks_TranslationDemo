@@ -26,6 +26,13 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 
+from src.utils.pdf_text_extractor import is_production_metadata_line
+
+try:
+    from src.utils.pdf_compressor import compress_pdf
+except ModuleNotFoundError:  # Direct execution: python src/utils/...
+    from pdf_compressor import compress_pdf
+
 
 DEFAULT_SKIP_FIRST = 5
 DEFAULT_SKIP_LAST = 4
@@ -34,6 +41,7 @@ MIN_FONT_SIZE = 6.0
 DEFAULT_UNICODE_FONT_CANDIDATES = (
     Path("/Library/Fonts/Arial Unicode.ttf"),
     Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+    Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
     Path("/System/Library/Fonts/LucidaGrande.ttc"),
     Path("/System/Library/Fonts/HelveticaNeue.ttc"),
 )
@@ -134,7 +142,7 @@ def collect_page_lines(page: fitz.Page) -> tuple[list[fitz.Rect], fitz.Rect, flo
         for line in block.get("lines", []):
             spans = line.get("spans", [])
             line_text = "".join(span.get("text", "") for span in spans).strip()
-            if not line_text:
+            if not line_text or is_production_metadata_line(line_text):
                 continue
             line_rects.append(fitz.Rect(line["bbox"]))
             font_sizes.extend(
@@ -232,6 +240,56 @@ def replace_page_text(
         )
 
 
+def replace_title_text(
+    page: fitz.Page,
+    translation: str,
+    font_file: Path | None,
+    padding: float,
+) -> None:
+    """Replace only the largest typographic text group on a title page."""
+
+    spans = [
+        span
+        for block in page.get_text("dict").get("blocks", [])
+        if block.get("type") == 0
+        for line in block.get("lines", [])
+        for span in line.get("spans", [])
+        if str(span.get("text", "")).strip()
+    ]
+    if not spans:
+        raise ValueError(f"No title text found on page {page.number + 1}.")
+    largest_size = max(float(span.get("size", 0)) for span in spans)
+    title_spans = [
+        span for span in spans if float(span.get("size", 0)) >= largest_size * 0.9
+    ]
+    rectangles = [fitz.Rect(span["bbox"]) for span in title_spans]
+    title_rect = fitz.Rect(rectangles[0])
+    for rectangle in rectangles[1:]:
+        title_rect.include_rect(rectangle)
+    title_rect.x0 -= padding
+    title_rect.y0 -= padding
+    title_rect.x1 += padding
+    title_rect.y1 += padding
+    # The source title page uses unusual embedded outline fonts. Applying PDF
+    # redactions to those streams can corrupt the page on some PyMuPDF builds.
+    # Its title area has a plain white background, so an opaque overlay is both
+    # visually exact and preserves the remaining author/copyright content.
+    page.draw_rect(title_rect, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+    font_name = register_font(page, font_file)
+    font_size = largest_size
+    status = insert_translation(
+        page, title_rect, translation, font_name, font_size, align=fitz.TEXT_ALIGN_CENTER
+    )
+    while status < 0 and font_size > MIN_FONT_SIZE:
+        font_size -= 0.5
+        status = insert_translation(
+            page, title_rect, translation, font_name, font_size,
+            align=fitz.TEXT_ALIGN_CENTER,
+        )
+    if status < 0:
+        raise ValueError("Translated title does not fit on its source title area.")
+
+
 def replace_names_on_page(
     page: fitz.Page,
     mapping: dict[str, str],
@@ -306,6 +364,8 @@ def replace_pdf_text(
     glossary_csv: Path | None = None,
     glossary_language: str | None = None,
     glossary_pages: list[int] | None = None,
+    title_translation: str | None = None,
+    title_page_number: int = 5,
 ) -> None:
     """Produce a new PDF with translated text inserted over body pages."""
 
@@ -338,6 +398,18 @@ def replace_pdf_text(
                 padding=padding,
             )
 
+        if title_translation:
+            if not 1 <= title_page_number <= document.page_count:
+                raise ValueError(
+                    f"Title page {title_page_number} exceeds the PDF page range."
+                )
+            replace_title_text(
+                document.load_page(title_page_number - 1),
+                title_translation,
+                font_file=font_file,
+                padding=padding,
+            )
+
         if glossary_csv and glossary_language and glossary_pages:
             mapping = build_glossary_mapping(glossary_csv, glossary_language)
             for page_number in glossary_pages:
@@ -355,6 +427,10 @@ def replace_pdf_text(
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         document.save(output_path, garbage=4, deflate=True)
+
+    # Image rewriting can invalidate resources added by PDF overlays. Stream
+    # compression is smaller but deliberately lossless for generated PDFs.
+    compress_pdf(output_path, output_path, recompress_images=False)
 
 
 def parse_args() -> argparse.Namespace:
@@ -412,6 +488,16 @@ def parse_args() -> argparse.Namespace:
         "--glossary-pages",
         help="Comma-separated 1-based page numbers for glossary-only name replacement, for example 2,3.",
     )
+    parser.add_argument(
+        "--title-translation",
+        help="Optional translated title to replace the largest text on the title page.",
+    )
+    parser.add_argument(
+        "--title-page-number",
+        type=int,
+        default=5,
+        help="1-based title page number used with --title-translation. Default: 5.",
+    )
     return parser.parse_args()
 
 
@@ -430,6 +516,8 @@ def main() -> None:
         glossary_csv=args.glossary_csv,
         glossary_language=args.glossary_language,
         glossary_pages=parse_page_numbers(args.glossary_pages),
+        title_translation=args.title_translation,
+        title_page_number=args.title_page_number,
     )
 
 
